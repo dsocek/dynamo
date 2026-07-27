@@ -9,7 +9,6 @@ import uuid
 from typing import Any, AsyncGenerator, Dict, List
 
 from vllm_omni.distributed.omni_connectors import initialize_orchestrator_connectors
-from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs
 
 from dynamo import prometheus_names
 from dynamo.common.storage import get_fs
@@ -35,6 +34,7 @@ from dynamo.vllm.omni.types import StageOutput
 from dynamo.vllm.omni.utils import (
     ensure_awaited,
     is_empty_payload,
+    resolve_stage_configs_compat,
     shm_deserialize,
     unwrap_connector_payload,
 )
@@ -55,10 +55,12 @@ class OmniStageRouter:
         (
             resolved_stage_configs_path,
             self.stage_configs,
-        ) = load_and_resolve_stage_configs(
+        ) = resolve_stage_configs_compat(
             config.model,
             stage_configs_path,
-            kwargs={},
+            trust_remote_code=getattr(
+                getattr(config, "engine_args", None), "trust_remote_code", False
+            ),
         )
         self.stage_clients: Dict[str, Any] = {}
 

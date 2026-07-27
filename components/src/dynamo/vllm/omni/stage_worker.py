@@ -20,7 +20,6 @@ from vllm_omni.distributed.omni_connectors import initialize_orchestrator_connec
 from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.stage_utils import serialize_obj, shm_write_bytes
-from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 from dynamo import prometheus_names
@@ -36,6 +35,7 @@ from dynamo.vllm.omni.utils import (
     ensure_awaited,
     is_empty_payload,
     parse_omni_request,
+    resolve_stage_configs_compat,
     unwrap_connector_payload,
 )
 
@@ -469,10 +469,12 @@ async def init_omni_stage(
         raise ValueError("--stage-id is required for stage worker initialization")
     stage_id: int = config.stage_id
 
-    resolved_stage_configs_path, stage_configs = load_and_resolve_stage_configs(
+    resolved_stage_configs_path, stage_configs = resolve_stage_configs_compat(
         config.model,
         config.stage_configs_path,
-        kwargs={},
+        trust_remote_code=getattr(
+            getattr(config, "engine_args", None), "trust_remote_code", False
+        ),
     )
     connector_configs_path = _ensure_stage_connectors(
         resolved_stage_configs_path,

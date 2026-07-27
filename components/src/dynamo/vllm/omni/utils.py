@@ -4,6 +4,7 @@
 """Shared utilities for the vLLM-Omni backend."""
 
 import asyncio
+import inspect
 import logging
 from typing import Any, cast
 
@@ -11,6 +12,7 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
 from vllm_omni.entrypoints.stage_utils import shm_read_bytes
+from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 from dynamo.common.utils.output_modalities import RequestType, parse_request_type
@@ -18,6 +20,15 @@ from dynamo.common.utils.video_utils import compute_num_frames, parse_size
 
 DEFAULT_IMAGE_SIZE = "1024x1024"
 DEFAULT_VIDEO_SIZE = "832x480"
+
+
+def resolve_stage_configs_compat(model, stage_configs_path, *, trust_remote_code=False):
+    # Adapt to old (2-tuple) and new (3-tuple, +trust_remote_code) vllm-omni.
+    kwargs = {"kwargs": {}}
+    if "trust_remote_code" in inspect.signature(load_and_resolve_stage_configs).parameters:
+        kwargs["trust_remote_code"] = trust_remote_code
+    result = load_and_resolve_stage_configs(model, stage_configs_path, **kwargs)
+    return result[0], result[1]
 
 
 def shm_deserialize(shm_meta: dict) -> Any:
