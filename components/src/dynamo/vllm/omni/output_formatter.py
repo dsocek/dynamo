@@ -11,16 +11,14 @@ output without creating an engine or loading model weights.
 import asyncio
 import base64
 import logging
-import tempfile
 import time
 import uuid
 from io import BytesIO
-from typing import Any, Dict, Optional
+from typing import Any, AsyncGenerator, Dict, Optional
 
 import numpy as np
 import soundfile as sf
 import torch
-from diffusers.utils.export_utils import export_to_video
 
 from dynamo.common.protocols.audio_protocol import AudioData, NvAudioSpeechResponse
 from dynamo.common.protocols.image_protocol import ImageData, NvImagesResponse
@@ -28,9 +26,19 @@ from dynamo.common.protocols.video_protocol import NvVideosResponse, VideoData
 from dynamo.common.storage import upload_to_fs
 from dynamo.common.utils.engine_response import normalize_finish_reason
 from dynamo.common.utils.output_modalities import RequestType
-from dynamo.common.utils.video_utils import normalize_video_frames
+from dynamo.common.utils.video_utils import encode_video
 from dynamo.vllm.handlers import build_prompt_tokens_details
+from dynamo.vllm.omni.cmaf_video import (
+    CMAF_INIT_TAG,
+    CMAF_METADATA_TAG,
+    CMAF_SEGMENT_PREFIX,
+    cmaf_emit_cadence_s,
+    cmaf_segment_seconds,
+    metadata_bytes,
+    package_frames_to_cmaf,
+)
 from dynamo.vllm.omni.utils import is_empty_payload
+from dynamo.vllm.omni.video_convert import to_canonical
 
 logger = logging.getLogger(__name__)
 
@@ -141,12 +149,10 @@ class DiffusionFormatter:
             )
         try:
             start_time = time.time()
-            frame_list = normalize_video_frames(images)
-            with tempfile.NamedTemporaryFile(
-                suffix=f".{output_format}", delete=True
-            ) as tmp:
-                await asyncio.to_thread(export_to_video, frame_list, tmp.name, fps)
-                video_bytes = tmp.read()
+            canonical = to_canonical(images)
+            video_bytes = await asyncio.to_thread(
+                encode_video, canonical, fps, container=output_format
+            )
 
             if response_format == "b64_json":
                 video_data = VideoData(
@@ -184,6 +190,90 @@ class DiffusionFormatter:
                 data=[],
                 error=str(e),
             ).model_dump()
+
+    def _cmaf_chunk(
+        self, request_id: str, created: int, tag: str, payload: bytes, progress: int
+    ) -> Dict[str, Any]:
+        """Build one binary-CMAF NvVideosResponse item (tag in url, b64 payload)."""
+        return NvVideosResponse(
+            id=request_id,
+            object="video",
+            model=self._model_name,
+            status="in_progress",
+            progress=progress,
+            created=created,
+            data=[
+                VideoData(
+                    output_format="mp4",
+                    url=tag,
+                    b64_json=base64.b64encode(payload).decode("ascii"),
+                )
+            ],
+        ).model_dump()
+
+    async def stream_video_cmaf(
+        self, stage_output: Any, request_id: str, *, fps: int
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Encode and fragment a generated clip, streaming binary-CMAF pieces.
+
+        Yields a ``cmaf:metadata`` item, then ``cmaf:init``, then one
+        ``cmaf:segment:{n}`` item per fMP4 media fragment. The frontend's
+        binary-CMAF route re-frames these into a single binary response body.
+        Non-final stage outputs (empty payloads) yield nothing.
+        """
+        images = (
+            stage_output.images if hasattr(stage_output, "images") else stage_output
+        )
+        if is_empty_payload(images):
+            return
+
+        created = int(time.time())
+        try:
+            canonical = to_canonical(images)
+            segment_seconds = cmaf_segment_seconds()
+            init_bytes, segments, target_duration, video_codec = (
+                await asyncio.to_thread(
+                    package_frames_to_cmaf, canonical, fps, segment_seconds
+                )
+            )
+        except Exception as e:
+            logger.error("Failed to package CMAF for request %s: %s", request_id, e)
+            yield NvVideosResponse(
+                id=request_id,
+                object="video",
+                model=self._model_name,
+                status="failed",
+                progress=0,
+                created=created,
+                data=[],
+                error=str(e),
+            ).model_dump()
+            return
+
+        yield self._cmaf_chunk(
+            request_id,
+            created,
+            CMAF_METADATA_TAG,
+            metadata_bytes(len(segments), target_duration, video_codec),
+            progress=0,
+        )
+        yield self._cmaf_chunk(
+            request_id, created, CMAF_INIT_TAG, init_bytes, progress=1
+        )
+
+        cadence = cmaf_emit_cadence_s()
+        total = len(segments)
+        for index, segment in enumerate(segments):
+            if cadence > 0:
+                await asyncio.sleep(cadence)
+            progress = min(99, int(((index + 1) / max(1, total)) * 100))
+            yield self._cmaf_chunk(
+                request_id,
+                created,
+                f"{CMAF_SEGMENT_PREFIX}{index}",
+                segment,
+                progress,
+            )
 
     async def _encode_image(
         self,
@@ -494,4 +584,12 @@ class OutputFormatter:
 
         return await formatter.format(
             stage_output, request_id, request_type=request_type, **ctx
+        )
+
+    def stream_video_cmaf(
+        self, stage_output: Any, request_id: str, *, fps: int
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Delegate binary-CMAF streaming to the diffusion (image/video) formatter."""
+        return self._formatters["image"].stream_video_cmaf(
+            stage_output, request_id, fps=fps
         )

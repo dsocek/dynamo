@@ -21,6 +21,7 @@ from dynamo.llm import ModelInput, WorkerType, register_model
 from dynamo.runtime import DistributedRuntime
 from dynamo.vllm.main import setup_metrics_collection
 from dynamo.vllm.omni.args import OmniConfig
+from dynamo.vllm.omni.cmaf_video import CMAF_ANNOTATION
 from dynamo.vllm.omni.connectors import register_dynamoomni_nixl_connector
 from dynamo.vllm.omni.output_formatter import OutputFormatter
 from dynamo.vllm.omni.stage_worker import (
@@ -192,12 +193,24 @@ class OmniStageRouter:
         if output_format is not None:
             fmt_ctx["output_format"] = output_format
 
+        # Binary CMAF streaming: the frontend's /v1/videos/stream/binary/cmaf
+        # route injects the experimental_binary_cmaf annotation. When present on
+        # a video request, fragment the finished clip and stream CMAF pieces
+        # instead of a single full-video response. ``nvext`` here is the raw
+        # request dict, not a Pydantic model, so check the annotation directly.
+        annotations = (nvext.get("annotations") or []) if isinstance(nvext, dict) else []
+        cmaf_enabled = (
+            request_type == RequestType.VIDEO_GENERATION
+            and CMAF_ANNOTATION in annotations
+        )
+
         async for chunk in self._format_output(
             final,
             request_id,
             request_type,
             fmt_ctx,
             final_stage_id=self.stage_configs[-1].stage_id,
+            cmaf_enabled=cmaf_enabled,
         ):
             yield chunk
 
@@ -208,6 +221,7 @@ class OmniStageRouter:
         request_type: RequestType,
         ctx: dict,
         final_stage_id: int = 0,
+        cmaf_enabled: bool = False,
     ) -> AsyncGenerator[dict, None]:
         """Read OmniRequestOutput from connector (multi-node) or SHM (single-node) and format."""
         # --- Connector path (multi-node: router and final stage on different machines) ---
@@ -258,6 +272,17 @@ class OmniStageRouter:
                 logger.warning("Router: no shm_meta in stage output")
                 return
             result = shm_deserialize(shm_meta)
+
+        # CMAF streaming path: encode + fragment the finished clip and stream
+        # metadata/init/segment pieces instead of a single full-video response.
+        if cmaf_enabled:
+            fps = ctx.get("fps", self.config.default_video_fps)
+            async for chunk in self._formatter.stream_video_cmaf(
+                result, request_id, fps=fps
+            ):
+                yield chunk
+            return
+
         chunk = await self._formatter.format(
             result, request_id, request_type=request_type, **ctx
         )
