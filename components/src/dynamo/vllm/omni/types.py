@@ -56,6 +56,11 @@ class StageOutput(BaseModel):
                 "sampling_params_list",
                 "finished",
                 "error",
+                # Per-chunk block-stream control signals (work-item b, §8): a
+                # non-terminal chunk carries only these (no tensor — latents
+                # travel via the connector under {request_id}_c{n}).
+                "chunk_index",
+                "is_last",
             }
             dropped = set(values.keys()) - known
             if dropped:
@@ -80,6 +85,12 @@ class StageOutput(BaseModel):
     sampling_params_list: dict | None = None
     finished: bool | None = None
     error: str | None = None
+    # Per-chunk block-stream control signals (work-item b, §8). Present only on
+    # a streamed stage's yields: chunk_index is the 0-based block index, is_last
+    # marks the terminal signal. The router (work-item c) uses these to dispatch
+    # a per-chunk downstream decode; they are not forwarded to the next stage.
+    chunk_index: int | None = None
+    is_last: bool | None = None
 
     def to_next_stage_request(self, request_id: str) -> dict:
         """Build the request dict for the next stage: only inter-stage protocol fields.

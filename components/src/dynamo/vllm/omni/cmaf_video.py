@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from typing import Optional
 
 import numpy as np
 
@@ -53,6 +54,7 @@ CMAF_FALLBACK_VIDEO_CODEC = "avc1.4d401f"
 
 _DEFAULT_SEGMENT_SECONDS = 2
 _DEFAULT_EMIT_CADENCE_MS = 0
+_DEFAULT_GOP_FRAMES = 4
 
 
 def has_cmaf_annotation(nvext) -> bool:
@@ -103,15 +105,37 @@ def cmaf_emit_cadence_s() -> float:
     return max(0, value) / 1000.0
 
 
+def cmaf_gop_frames() -> int:
+    """Encoder GOP / fragment length in frames (env: ``DYN_CMAF_GOP_FRAMES``).
+
+    For the live persistent-ffmpeg path, keyframes (and therefore fragment
+    boundaries) land every this many frames. Small values reduce latency; the
+    one-fragment flush lag is intrinsic to fragmented MP4.
+    """
+    raw = os.environ.get("DYN_CMAF_GOP_FRAMES")
+    if not raw:
+        return _DEFAULT_GOP_FRAMES
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid DYN_CMAF_GOP_FRAMES=%r; using %d", raw, _DEFAULT_GOP_FRAMES)
+        return _DEFAULT_GOP_FRAMES
+    return max(1, value)
+
+
 def source_buffer_mime_type(video_codec: str) -> str:
     """MSE ``SourceBuffer`` mime type for the packaged video-only asset."""
     return f'video/mp4; codecs="{video_codec}"'
 
 
 def metadata_bytes(
-    segment_count: int, target_duration_seconds: int, video_codec: str
+    segment_count: Optional[int], target_duration_seconds: int, video_codec: str
 ) -> bytes:
-    """Serialize the ``cmaf:metadata`` payload (JSON, UTF-8)."""
+    """Serialize the ``cmaf:metadata`` payload (JSON, UTF-8).
+
+    ``segment_count`` is ``None`` on the live streaming path (the total is not
+    known ahead of time); the client keys end-of-stream off the DONE frame.
+    """
     payload = {
         "protocol": CMAF_PROTOCOL,
         "mime_type": "video/mp4",

@@ -165,10 +165,65 @@ class OmniStageWorker:
         sp = _build_sampling_params(self.stage_config, sampling_params_list_override)
         last_result = None
 
+        # --- Write output ---
+        # Check for a downstream connector first, regardless of final_output.
+        # In vllm-omni's native mode, multiple stages can set final_output=True
+        # (meaning "produces user-visible output"). In Dynamo's disaggregated
+        # mode the actual pipeline topology — connector edges from the YAML —
+        # determines whether output should go to a connector or to SHM.
+        from_s, to_s = _connector_key(self.stage_id, self.stage_id + 1)
+        connector = self.connectors.get((from_s, to_s))
+
+        # Per-chunk block-stream lane (work-item b, §6.2/§8). The DiT engine can
+        # emit N non-terminal latent blocks (finished=False) followed by one
+        # terminal sentinel. When such a block arrives — and a downstream
+        # connector exists — deliver it immediately under the per-chunk key
+        # f"{request_id}_c{n}" and RPC-yield a tiny control signal (no tensor).
+        # The default (aggregated) engine emits a single finished=True output, so
+        # n_streamed stays 0 and the untouched post-loop path runs as before.
+        n_streamed = 0
         try:
             async for chunk in self.engine.generate(
                 prompt, request_id=request_id, sampling_params_list=sp
             ):
+                if not bool(getattr(chunk, "finished", False)):
+                    if connector is not None:
+                        # Inter-stage lane (work-item b): DiT streams latent
+                        # blocks to the next stage under per-chunk connector keys.
+                        if not await self._put_stream_chunk(
+                            connector, from_s, to_s, request_id, n_streamed, chunk
+                        ):
+                            yield {"error": "per-chunk connector.put() failed", "finished": True}
+                            return
+                        logger.info(
+                            "[cmaf-timing] stage %d (DiT) put latent block %d -> connector for %s",
+                            self.stage_id, n_streamed, request_id,
+                        )
+                        yield {"chunk_index": n_streamed, "is_last": False, "finished": False}
+                    else:
+                        # Final-stage lane (work-item c): VAE streams pixel chunks
+                        # to the router. Pixel tensors can't ride the JSON RPC, so
+                        # each chunk goes to SHM under its per-chunk name and the
+                        # RPC yields only the ref for the router to deserialize.
+                        try:
+                            shm_meta = self._write_stream_chunk_shm(
+                                request_id, n_streamed, chunk
+                            )
+                        except Exception as e:
+                            yield {"error": f"per-chunk SHM write failed: {e}", "finished": True}
+                            return
+                        logger.info(
+                            "[cmaf-timing] stage %d (VAE) decoded pixel chunk %d -> SHM for %s",
+                            self.stage_id, n_streamed, request_id,
+                        )
+                        yield {
+                            "chunk_index": n_streamed,
+                            "is_last": False,
+                            "finished": False,
+                            "shm_meta": shm_meta,
+                        }
+                    n_streamed += 1
+                    continue
                 last_result = chunk
         except Exception as e:
             logger.error(
@@ -181,16 +236,33 @@ class OmniStageWorker:
             yield {"error": str(e), "finished": True}
             return
 
+        if n_streamed > 0:
+            if connector is not None:
+                # Inter-stage streamed (b): every block is already on the
+                # connector under its per-chunk key. Emit only a terminal control
+                # signal whose ref carries num_chunks so the consumer knows how
+                # many per-chunk keys to fetch (§8). No tensor travels over RPC.
+                out: dict = {
+                    "original_prompt": original_prompt,
+                    "stage_connector_refs": {
+                        **{str(k): v for k, v in stage_connector_refs.items()},
+                        str(self.stage_id): {"num_chunks": n_streamed, "chunked": True},
+                    },
+                    "chunk_index": n_streamed - 1,
+                    "is_last": True,
+                    "finished": True,
+                }
+                if sampling_params_list_override is not None:
+                    out["sampling_params_list"] = sampling_params_list_override
+                yield out
+            else:
+                # Final-stage streamed (c): pixel chunks were already delivered to
+                # the router via per-chunk SHM. The terminal is a bare sentinel.
+                yield {"chunk_index": n_streamed - 1, "is_last": True, "finished": True}
+            return
+
         _ensure_cumulative_token_ids(last_result)
 
-        # --- Write output ---
-        # Check for a downstream connector first, regardless of final_output.
-        # In vllm-omni's native mode, multiple stages can set final_output=True
-        # (meaning "produces user-visible output"). In Dynamo's disaggregated
-        # mode the actual pipeline topology — connector edges from the YAML —
-        # determines whether output should go to a connector or to SHM.
-        from_s, to_s = _connector_key(self.stage_id, self.stage_id + 1)
-        connector = self.connectors.get((from_s, to_s))
         if connector is not None:
             try:
                 put_result = await ensure_awaited(
@@ -274,6 +346,64 @@ class OmniStageWorker:
         # SHM fallback -- only works when router and final stage are on the same node.
         shm_meta = shm_write_bytes(serialize_obj(last_result), name=request_id)
         yield {"shm_meta": shm_meta, "finished": True}
+
+    async def _put_stream_chunk(
+        self,
+        connector: Any,
+        from_s: str,
+        to_s: str,
+        request_id: str,
+        chunk_index: int,
+        chunk: Any,
+    ) -> bool:
+        """Write one streamed block under the per-chunk key ``{request_id}_c{n}``.
+
+        The per-chunk key is the actual fix (§8): the SHM connector overwrites
+        on a repeated key, so a single ``request_id`` key would clobber every
+        block but the last. Returns the connector's ok flag; errors are logged
+        and reported as a failed put (POC: no retry).
+        """
+        _ensure_cumulative_token_ids(chunk)
+        try:
+            ok, _, _ = await ensure_awaited(
+                connector.put(  # type: ignore[arg-type]
+                    from_s,
+                    to_s,
+                    _chunk_key(request_id, chunk_index),
+                    _prepare_connector_payload(
+                        chunk,
+                        from_stage=self.stage_id,
+                        to_stage=self.stage_id + 1,
+                    ),
+                )
+            )
+        except Exception as e:
+            logger.error(
+                "Stage %d: per-chunk connector.put() raised for %s c%d: %s: %s",
+                self.stage_id,
+                request_id,
+                chunk_index,
+                type(e).__name__,
+                e,
+                exc_info=True,
+            )
+            return False
+        return bool(ok)
+
+    def _write_stream_chunk_shm(
+        self, request_id: str, chunk_index: int, chunk: Any
+    ) -> dict:
+        """Write one streamed pixel chunk to SHM under its per-chunk name (§c).
+
+        The final (VAE) stage has no downstream connector, so pixel chunks reach
+        the router the same way the aggregated final output does — via SHM — but
+        under the per-chunk name ``{request_id}_c{n}`` so streamed frames don't
+        clobber each other. Returns the shm_meta ref for the router to read with
+        ``shm_deserialize``.
+        """
+        return shm_write_bytes(
+            serialize_obj(chunk), name=_chunk_key(request_id, chunk_index)
+        )
 
     def _build_engine_core_request_from_upstream(
         self,
@@ -424,6 +554,17 @@ class OmniStageWorker:
                 raise RuntimeError(
                     f"Stage {self.stage_id}: no connector for edge ({stage_k}→{self.stage_id})"
                 )
+            # Chunked upstream (work-item c): the producer streamed N blocks under
+            # per-chunk keys instead of one payload. Gather them in order and
+            # reassemble a single engine_inputs so the processor/engine sees one
+            # combined input (the VAE decodes the whole clip in one streaming
+            # forward — feat_cache must persist across all latent frames).
+            if isinstance(meta_k, dict) and meta_k.get("chunked"):
+                engine_inputs = await self._fetch_chunked_stage_input(
+                    stage_k, request_id, int(meta_k.get("num_chunks", 0))
+                )
+                stage_list.append(_Proxy(engine_outputs=[engine_inputs]))
+                continue
             try:
                 get_result = await ensure_awaited(
                     connector.get(
@@ -437,22 +578,90 @@ class OmniStageWorker:
                 raise RuntimeError(
                     f"Stage {self.stage_id}: connector.get() failed: {e}"
                 ) from e
-            payload_data = unwrap_connector_payload(get_result)
-            if is_empty_payload(payload_data):
-                raise RuntimeError(
-                    f"Stage {self.stage_id}: empty payload from connector ({stage_k}→{self.stage_id})"
-                )
-            if isinstance(payload_data, dict) and "engine_inputs" in payload_data:
-                engine_inputs = payload_data["engine_inputs"]
-                _restore_completion_output_attrs(
-                    engine_inputs,
-                    payload_data.get("_dynamo_completion_output_attrs"),
-                )
-            else:
-                engine_inputs = payload_data
-            _ensure_cumulative_token_ids(engine_inputs)
+            engine_inputs = self._unwrap_stage_payload(
+                get_result, f"({stage_k}→{self.stage_id})"
+            )
             stage_list.append(_Proxy(engine_outputs=[engine_inputs]))
         return stage_list
+
+    async def _fetch_chunked_stage_input(
+        self, from_stage: int, request_id: str, num_chunks: int
+    ) -> Any:
+        """Reassemble a chunk-streamed upstream output into one engine_inputs.
+
+        The producer (DiT) streamed ``num_chunks`` latent blocks under the
+        per-chunk keys ``{request_id}_c{n}`` (work-item b). Fetch them in order
+        and concatenate their latent tensors along the temporal axis (dim=2 of
+        ``[B, C, T, H, W]``) into the first chunk's output, so the downstream
+        processor (``dit2vae``) reads one full-clip latent exactly as it would
+        from a single-payload upstream. Raises RuntimeError on a missing chunk.
+        """
+        if num_chunks <= 0:
+            raise RuntimeError(
+                f"Stage {self.stage_id}: chunked ref from stage {from_stage} has num_chunks={num_chunks}"
+            )
+        chunks = [
+            await self.fetch_stage_chunk(from_stage, request_id, n)
+            for n in range(num_chunks)
+        ]
+        combined = chunks[0]
+        latents = [_primary_latent(c) for c in chunks]
+        if any(lat is None for lat in latents):
+            # No latent field (non-video upstream): fall back to the first chunk
+            # untouched rather than guessing how to merge opaque payloads.
+            return combined
+        _set_primary_latent(combined, torch.cat(latents, dim=2))
+        return combined
+
+    async def fetch_stage_chunk(
+        self, from_stage: int, request_id: str, chunk_index: int
+    ) -> Any:
+        """Fetch one streamed block by its per-chunk key (work-item b, §8).
+
+        The consumer decodes each chunk exactly once, in order, so it reads a
+        single key ``{request_id}_c{n}`` with no window and no metadata ticket —
+        the SHM connector's ``get`` falls back to ``_get_by_key`` when metadata
+        is omitted. The router (work-item c) drives this per block. Raises
+        RuntimeError on a missing connector edge or an empty/absent chunk.
+        """
+        connector = self.connectors.get(_connector_key(from_stage, self.stage_id))
+        if connector is None:
+            raise RuntimeError(
+                f"Stage {self.stage_id}: no connector for edge ({from_stage}→{self.stage_id})"
+            )
+        try:
+            get_result = await ensure_awaited(
+                connector.get(
+                    str(from_stage),
+                    str(self.stage_id),
+                    _chunk_key(request_id, chunk_index),
+                )
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Stage {self.stage_id}: connector.get() failed for chunk c{chunk_index}: {e}"
+            ) from e
+        return self._unwrap_stage_payload(
+            get_result, f"({from_stage}→{self.stage_id}) chunk c{chunk_index}"
+        )
+
+    def _unwrap_stage_payload(self, get_result: Any, where: str) -> Any:
+        """Unwrap a connector get result into engine_inputs (shared by both fetch paths)."""
+        payload_data = unwrap_connector_payload(get_result)
+        if is_empty_payload(payload_data):
+            raise RuntimeError(
+                f"Stage {self.stage_id}: empty payload from connector {where}"
+            )
+        if isinstance(payload_data, dict) and "engine_inputs" in payload_data:
+            engine_inputs = payload_data["engine_inputs"]
+            _restore_completion_output_attrs(
+                engine_inputs,
+                payload_data.get("_dynamo_completion_output_attrs"),
+            )
+        else:
+            engine_inputs = payload_data
+        _ensure_cumulative_token_ids(engine_inputs)
+        return engine_inputs
 
 
 async def init_omni_stage(
@@ -562,6 +771,16 @@ async def init_omni_stage(
 def _connector_key(from_stage: int | str, to_stage: int | str) -> tuple[str, str]:
     """Build the connector dict key used by initialize_orchestrator_connectors."""
     return (str(from_stage), str(to_stage))
+
+
+def _chunk_key(request_id: str, chunk_index: int) -> str:
+    """Per-chunk connector address (§8): ``{request_id}_c{n}``.
+
+    Both producer (DiT) and consumer (VAE) derive this from ``request_id`` + the
+    0-based chunk index alone, so the SHM connector can locate the block purely
+    by key (``get(metadata=None)`` → ``_get_by_key``) with no handshake.
+    """
+    return f"{request_id}_c{chunk_index}"
 
 
 def _uses_nixl_connector(stage_configs_path: str, stage_configs: list[Any]) -> bool:
@@ -768,6 +987,53 @@ def _restore_completion_output_attrs(
             output.cumulative_token_ids = list(attrs["cumulative_token_ids"])
         if "multimodal_output" in attrs:
             output.multimodal_output = attrs["multimodal_output"]
+
+
+def _primary_latent(engine_inputs: Any) -> torch.Tensor | None:
+    """Read the DiT latent tensor off a stage output (work-item c reassembly).
+
+    Mirrors ``dit2vae._latent_from_output``: the streamed DiT block is a diffusion
+    ``OmniRequestOutput`` whose post-processed latent lands on the *top-level*
+    ``multimodal_output['latent']`` (backed by ``_multimodal_output``) — the only
+    channel the inter-stage connector preserves (``.images`` is dropped). Read
+    that first, then any completion-output ``multimodal_output`` (the pipeline-
+    stage shape), then ``.images[0]`` (the in-process no-connector channel).
+    Returns None when no latent tensor is present so the caller can fall back.
+    """
+    mm = getattr(engine_inputs, "multimodal_output", None)
+    if isinstance(mm, dict) and isinstance(mm.get("latent"), torch.Tensor):
+        return mm["latent"]
+    for output in _iter_completion_outputs(engine_inputs):
+        mm = getattr(output, "multimodal_output", None)
+        if isinstance(mm, dict) and isinstance(mm.get("latent"), torch.Tensor):
+            return mm["latent"]
+    images = getattr(engine_inputs, "images", None)
+    if images:
+        first = images[0] if isinstance(images, (list, tuple)) else images
+        if isinstance(first, torch.Tensor):
+            return first
+    return None
+
+
+def _set_primary_latent(engine_inputs: Any, latent: torch.Tensor) -> None:
+    """Write the combined latent back onto the reassembled stage output.
+
+    Sets whichever channel ``_primary_latent`` reads (top-level
+    multimodal_output first, then a completion output's, else ``.images[0]``) so
+    ``dit2vae`` sees the full-clip latent.
+    """
+    mm = getattr(engine_inputs, "multimodal_output", None)
+    if isinstance(mm, dict) and isinstance(mm.get("latent"), torch.Tensor):
+        mm["latent"] = latent
+        return
+    for output in _iter_completion_outputs(engine_inputs):
+        mm = getattr(output, "multimodal_output", None)
+        if isinstance(mm, dict) and isinstance(mm.get("latent"), torch.Tensor):
+            mm["latent"] = latent
+            return
+    images = getattr(engine_inputs, "images", None)
+    if images and isinstance(images, list) and isinstance(images[0], torch.Tensor):
+        images[0] = latent
 
 
 def _ensure_cumulative_token_ids(engine_inputs: Any) -> None:

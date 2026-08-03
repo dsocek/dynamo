@@ -5,6 +5,7 @@
 
 import json
 import logging
+import time
 import uuid
 from typing import Any, AsyncGenerator, Dict, List
 
@@ -17,11 +18,21 @@ from dynamo.common.utils.output_modalities import (
     get_output_modalities,
     parse_request_type,
 )
+from dynamo.common.utils.video_utils import StreamingCmafEncoder
 from dynamo.llm import ModelInput, WorkerType, register_model
 from dynamo.runtime import DistributedRuntime
 from dynamo.vllm.main import setup_metrics_collection
 from dynamo.vllm.omni.args import OmniConfig
-from dynamo.vllm.omni.cmaf_video import CMAF_ANNOTATION
+from dynamo.vllm.omni.cmaf_video import (
+    CMAF_ANNOTATION,
+    CMAF_FALLBACK_VIDEO_CODEC,
+    CMAF_INIT_TAG,
+    CMAF_METADATA_TAG,
+    CMAF_SEGMENT_PREFIX,
+    cmaf_gop_frames,
+    cmaf_segment_seconds,
+    metadata_bytes,
+)
 from dynamo.vllm.omni.connectors import register_dynamoomni_nixl_connector
 from dynamo.vllm.omni.output_formatter import OutputFormatter
 from dynamo.vllm.omni.stage_worker import (
@@ -39,6 +50,7 @@ from dynamo.vllm.omni.utils import (
     shm_deserialize,
     unwrap_connector_payload,
 )
+from dynamo.vllm.omni.video_convert import to_canonical
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +123,23 @@ class OmniStageRouter:
         request_id = str(uuid.uuid4())
         _, request_type = parse_request_type(request, self.config.output_modalities)
 
+        # Binary CMAF live streaming: when the request is CMAF-annotated video,
+        # the final (VAE) stage streams pixel chunks and the router pumps each
+        # straight into a persistent CMAF encoder (work-item c). Detect it up
+        # front so we can take the live path instead of the batch drain below.
+        nvext_early = request.get("nvext") or {}
+        annotations_early = (
+            (nvext_early.get("annotations") or []) if isinstance(nvext_early, dict) else []
+        )
+        cmaf_live = (
+            request_type == RequestType.VIDEO_GENERATION
+            and CMAF_ANNOTATION in annotations_early
+        )
+        if cmaf_live:
+            async for chunk in self._stream_cmaf_live(request, request_id, request_type):
+                yield chunk
+            return
+
         stage_outputs: List[StageOutput] = []
         for stage_idx, stage_cfg in enumerate(self.stage_configs):
             model_stage = getattr(
@@ -131,16 +160,24 @@ class OmniStageRouter:
                 stage_request = stage_outputs[-1].to_next_stage_request(request_id)
 
             raw_stage_output = {}
+            # A streamed final stage (VAE with streaming_output on) delivers pixel
+            # chunks as multiple per-chunk-SHM yields; collect their refs so the
+            # batch path can reassemble the full clip. Non-final streamed stages
+            # (DiT) end with a chunked connector ref the next stage reassembles,
+            # so their intermediate control signals are simply ignored here.
+            pixel_chunk_metas: list[dict] = []
             logger.info(
                 "Router: stage %d request keys=%s",
                 stage_idx,
                 list(stage_request.keys()),
             )
-            # For now, it is just one chunk output from the stage. Keeping the loop style in mind if in future we decide to stream multiple chunks from the stage.
             async for chunk in await client.round_robin(stage_request):
                 data = chunk.data()
                 if isinstance(data, (str, bytes)):
                     data = json.loads(data)
+                if not data.get("finished") and data.get("shm_meta") is not None:
+                    pixel_chunk_metas.append(data["shm_meta"])
+                    continue
                 raw_stage_output.update(data)
             stage_outputs.append(StageOutput.model_validate(raw_stage_output))
 
@@ -149,6 +186,27 @@ class OmniStageRouter:
                 return
 
         final = stage_outputs[-1]
+        # Streamed final-stage pixels: reassemble the per-chunk SHM outputs into
+        # one full-clip result and format it directly (bypassing the single-
+        # shm_meta read in _format_output, which a streamed stage never sets).
+        if pixel_chunk_metas:
+            result = _reassemble_pixel_chunks(pixel_chunk_metas)
+            fmt_ctx_stream: Dict[str, Any] = {}
+            nvext_s = request.get("nvext") or {}
+            if nvext_s.get("fps") is not None:
+                fmt_ctx_stream["fps"] = nvext_s["fps"]
+            if request.get("response_format") is not None:
+                fmt_ctx_stream["response_format"] = request["response_format"]
+            if request.get("output_format") is not None:
+                fmt_ctx_stream["output_format"] = request["output_format"]
+            chunk = await self._formatter.format(
+                result, request_id, request_type=request_type, **fmt_ctx_stream
+            )
+            if chunk:
+                yield chunk
+            else:
+                yield {"error": "Formatter returned no output for streamed clip", "finished": True}
+            return
         connectors = getattr(self, "connectors", {})
         # Accept either connector-based output (multi-node) or SHM (single-node legacy).
         # Connector path: final stage wrote via connector.put(to_stage="router") and
@@ -213,6 +271,149 @@ class OmniStageRouter:
             cmaf_enabled=cmaf_enabled,
         ):
             yield chunk
+
+    async def _stream_cmaf_live(
+        self,
+        request: dict,
+        request_id: str,
+        request_type: RequestType,
+    ) -> AsyncGenerator[dict, None]:
+        """Live per-chunk CMAF pump (work-item c).
+
+        DiT streams latent blocks to the connector (work-item b) and RPC-yields a
+        terminal ref; the router drives it to completion exactly like the batch
+        path (the intermediate control signals carry no data). The VAE stage then
+        reassembles those latents and streams **pixel chunks** — one decoded frame
+        at a time, feat_cache persisted so the stream is seam-free (§7.0) — each
+        delivered via per-chunk SHM. The router deserializes each pixel chunk and
+        pushes it straight into a single persistent CMAF encoder, yielding
+        metadata/init/segment items on the same wire contract as the batch path
+        (§5). Only the *source* of the tagged items changes: streamed, not batched.
+        """
+        # Two stages exactly: DiT (0) then VAE (1). This live path is registered
+        # only for the disaggregated causal-forcing video pipeline.
+        if len(self.stage_configs) < 2:
+            yield {"error": "CMAF live streaming requires a 2-stage pipeline", "finished": True}
+            return
+
+        dit_cfg, vae_cfg = self.stage_configs[0], self.stage_configs[1]
+        dit_stage = getattr(dit_cfg.engine_args, "model_stage", "stage0")
+        vae_stage = getattr(vae_cfg.engine_args, "model_stage", "stage1")
+        dit_client = self.stage_clients.get(dit_stage)
+        vae_client = self.stage_clients.get(vae_stage)
+        if dit_client is None or vae_client is None:
+            yield {"error": "CMAF live streaming: missing DiT or VAE stage client", "finished": True}
+            return
+
+        # --- Stage 0 (DiT): drive to completion, collect the terminal ref. ---
+        # NOTE: the VAE is dispatched only AFTER the DiT rollout finishes (not
+        # after the first latent block): the VAE decode is temporally stateful
+        # (feat_cache), so all latent frames must pass through one persistent
+        # forward. The [cmaf-timing] logs make the DiT-done -> VAE-start handoff
+        # and time-to-first-frame explicit so a long startup can be attributed
+        # to the DiT rollout rather than a handoff stall.
+        t0 = time.monotonic()
+        logger.info("[cmaf-timing] router: DiT started for %s", request_id)
+        dit_raw: dict = {}
+        async for chunk in await dit_client.round_robin({"request_id": request_id, **request}):
+            data = chunk.data()
+            if isinstance(data, (str, bytes)):
+                data = json.loads(data)
+            dit_raw.update(data)
+        dit_output = StageOutput.model_validate(dit_raw)
+        if dit_output.error:
+            yield {"error": dit_output.error, "finished": True}
+            return
+        logger.info(
+            "[cmaf-timing] router: DiT done for %s in %.2fs; dispatching VAE",
+            request_id, time.monotonic() - t0,
+        )
+
+        # --- Stage 1 (VAE): consume the live pixel-chunk stream. ---
+        fps = int((request.get("nvext") or {}).get("fps") or self.config.default_video_fps)
+        vae_request = dit_output.to_next_stage_request(request_id)
+        created = int(time.time())
+        t_vae = time.monotonic()
+        pixel_chunks_seen = 0
+        enc: StreamingCmafEncoder | None = None
+        metadata_sent = False
+        seg_index = 0
+
+        # _cmaf_chunk lives on the DiffusionFormatter ("image"), not the
+        # dispatcher OutputFormatter; reach it the same way stream_video_cmaf does.
+        diffusion_formatter = self._formatter._formatters["image"]
+
+        async def _emit(kind: str, payload: bytes) -> AsyncGenerator[dict, None]:
+            nonlocal metadata_sent, seg_index
+            if kind == "init":
+                if not metadata_sent:
+                    yield diffusion_formatter._cmaf_chunk(
+                        request_id,
+                        created,
+                        CMAF_METADATA_TAG,
+                        metadata_bytes(
+                            None,
+                            cmaf_segment_seconds(),
+                            (enc.codec_string() if enc else None) or CMAF_FALLBACK_VIDEO_CODEC,
+                        ),
+                        progress=0,
+                    )
+                    metadata_sent = True
+                yield diffusion_formatter._cmaf_chunk(request_id, created, CMAF_INIT_TAG, payload, progress=1)
+            else:
+                yield diffusion_formatter._cmaf_chunk(
+                    request_id,
+                    created,
+                    f"{CMAF_SEGMENT_PREFIX}{seg_index}",
+                    payload,
+                    progress=min(99, 2 + seg_index),
+                )
+                seg_index += 1
+
+        try:
+            async for chunk in await vae_client.round_robin(vae_request):
+                data = chunk.data()
+                if isinstance(data, (str, bytes)):
+                    data = json.loads(data)
+                if data.get("error"):
+                    yield {"error": data["error"], "finished": True}
+                    return
+                # Terminal sentinel: no pixels — the tail is drained by finish().
+                if data.get("finished") and data.get("shm_meta") is None:
+                    break
+                shm_meta = data.get("shm_meta")
+                if shm_meta is None:
+                    continue
+                pixel_output = shm_deserialize(shm_meta)
+                images = getattr(pixel_output, "images", pixel_output)
+                if is_empty_payload(images):
+                    continue
+                canonical = to_canonical(images)
+                pixel_chunks_seen += 1
+                logger.info(
+                    "[cmaf-timing] router: VAE pixel chunk %d received for %s at +%.2fs (VAE start->here)",
+                    pixel_chunks_seen - 1, request_id, time.monotonic() - t_vae,
+                )
+                if enc is None:
+                    height, width = int(canonical.shape[1]), int(canonical.shape[2])
+                    enc = StreamingCmafEncoder(fps, width, height, gop_frames=cmaf_gop_frames())
+                    await enc.start()
+                async for kind, payload in enc.push(canonical):
+                    async for item in _emit(kind, payload):
+                        yield item
+
+            if enc is not None:
+                async for kind, payload in enc.finish():
+                    async for item in _emit(kind, payload):
+                        yield item
+        except Exception as e:
+            logger.error("Router: CMAF live stream failed for %s: %s", request_id, e, exc_info=True)
+            yield {"error": f"CMAF live stream failed: {e}", "finished": True}
+            return
+        # Natural end: the Rust route emits the DONE(0x05) frame when this
+        # generator closes (§9). request_type is accepted for symmetry with the
+        # batch path; the CMAF wire contract is modality-fixed.
+        _ = request_type
 
     async def _format_output(
         self,
@@ -298,6 +499,32 @@ class OmniStageRouter:
                 "error": f"Formatter returned no output for type '{final_output_type}'",
                 "finished": True,
             }
+
+
+def _reassemble_pixel_chunks(pixel_chunk_metas: list[dict]) -> Any:
+    """Concatenate streamed per-chunk pixel outputs into one full-clip result.
+
+    Each ref points to an ``OmniRequestOutput`` carrying one decoded chunk's
+    pixels on ``.images``. Read them in order, canonicalize to ``(t, H, W, 3)``
+    uint8, concatenate along time, and hand the combined clip back on the first
+    output object so the formatter treats it exactly like a batch result.
+    """
+    import numpy as np
+
+    outputs = [shm_deserialize(m) for m in pixel_chunk_metas]
+    frames = [
+        to_canonical(getattr(o, "images", o))
+        for o in outputs
+        if not is_empty_payload(getattr(o, "images", o))
+    ]
+    if not frames:
+        return outputs[0]
+    combined = np.concatenate(frames, axis=0)  # (T, H, W, 3)
+    result = outputs[0]
+    if hasattr(result, "images"):
+        result.images = [combined]
+        return result
+    return [combined]
 
 
 async def init_omni_stage_router(

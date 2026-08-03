@@ -26,16 +26,17 @@ from dynamo.common.protocols.video_protocol import NvVideosResponse, VideoData
 from dynamo.common.storage import upload_to_fs
 from dynamo.common.utils.engine_response import normalize_finish_reason
 from dynamo.common.utils.output_modalities import RequestType
-from dynamo.common.utils.video_utils import encode_video
+from dynamo.common.utils.video_utils import StreamingCmafEncoder, encode_video
 from dynamo.vllm.handlers import build_prompt_tokens_details
 from dynamo.vllm.omni.cmaf_video import (
+    CMAF_FALLBACK_VIDEO_CODEC,
     CMAF_INIT_TAG,
     CMAF_METADATA_TAG,
     CMAF_SEGMENT_PREFIX,
     cmaf_emit_cadence_s,
+    cmaf_gop_frames,
     cmaf_segment_seconds,
     metadata_bytes,
-    package_frames_to_cmaf,
 )
 from dynamo.vllm.omni.utils import is_empty_payload
 from dynamo.vllm.omni.video_convert import to_canonical
@@ -214,12 +215,18 @@ class DiffusionFormatter:
     async def stream_video_cmaf(
         self, stage_output: Any, request_id: str, *, fps: int
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Encode and fragment a generated clip, streaming binary-CMAF pieces.
+        """Encode a generated clip through a persistent ffmpeg, streaming CMAF.
 
         Yields a ``cmaf:metadata`` item, then ``cmaf:init``, then one
-        ``cmaf:segment:{n}`` item per fMP4 media fragment. The frontend's
-        binary-CMAF route re-frames these into a single binary response body.
-        Non-final stage outputs (empty payloads) yield nothing.
+        ``cmaf:segment:{n}`` item per fMP4 media fragment as the muxer flushes
+        them. The frontend's binary-CMAF route re-frames these into a single
+        binary response body. Non-final stage outputs (empty payloads) yield
+        nothing.
+
+        Step 2 posture: generation is still batch (the whole clip arrives here at
+        once), but it is fed through ``StreamingCmafEncoder`` in one ``push`` so
+        the *wire behavior* -- streamed segments, ``segment_count=None``, codec
+        parsed from the live init -- already matches the future per-chunk path.
         """
         images = (
             stage_output.images if hasattr(stage_output, "images") else stage_output
@@ -228,16 +235,56 @@ class DiffusionFormatter:
             return
 
         created = int(time.time())
+        cadence = cmaf_emit_cadence_s()
         try:
             canonical = to_canonical(images)
-            segment_seconds = cmaf_segment_seconds()
-            init_bytes, segments, target_duration, video_codec = (
-                await asyncio.to_thread(
-                    package_frames_to_cmaf, canonical, fps, segment_seconds
-                )
+            height, width = canonical.shape[1], canonical.shape[2]
+            enc = StreamingCmafEncoder(
+                fps, width, height, gop_frames=cmaf_gop_frames()
             )
+            await enc.start()
+
+            seg_index = 0
+
+            async def emit(kind: str, payload: bytes):
+                nonlocal seg_index
+                if kind == "init":
+                    # The codec string is parsed FROM the init, and metadata must
+                    # precede the init append on the client -- so send it here.
+                    yield self._cmaf_chunk(
+                        request_id,
+                        created,
+                        CMAF_METADATA_TAG,
+                        metadata_bytes(
+                            None,
+                            cmaf_segment_seconds(),
+                            enc.codec_string() or CMAF_FALLBACK_VIDEO_CODEC,
+                        ),
+                        progress=0,
+                    )
+                    yield self._cmaf_chunk(
+                        request_id, created, CMAF_INIT_TAG, payload, progress=1
+                    )
+                else:
+                    if cadence > 0:
+                        await asyncio.sleep(cadence)
+                    yield self._cmaf_chunk(
+                        request_id,
+                        created,
+                        f"{CMAF_SEGMENT_PREFIX}{seg_index}",
+                        payload,
+                        progress=min(99, 2 + seg_index),
+                    )
+                    seg_index += 1
+
+            async for kind, payload in enc.push(canonical):
+                async for chunk in emit(kind, payload):
+                    yield chunk
+            async for kind, payload in enc.finish():
+                async for chunk in emit(kind, payload):
+                    yield chunk
         except Exception as e:
-            logger.error("Failed to package CMAF for request %s: %s", request_id, e)
+            logger.error("Failed to stream CMAF for request %s: %s", request_id, e)
             yield NvVideosResponse(
                 id=request_id,
                 object="video",
@@ -249,31 +296,6 @@ class DiffusionFormatter:
                 error=str(e),
             ).model_dump()
             return
-
-        yield self._cmaf_chunk(
-            request_id,
-            created,
-            CMAF_METADATA_TAG,
-            metadata_bytes(len(segments), target_duration, video_codec),
-            progress=0,
-        )
-        yield self._cmaf_chunk(
-            request_id, created, CMAF_INIT_TAG, init_bytes, progress=1
-        )
-
-        cadence = cmaf_emit_cadence_s()
-        total = len(segments)
-        for index, segment in enumerate(segments):
-            if cadence > 0:
-                await asyncio.sleep(cadence)
-            progress = min(99, int(((index + 1) / max(1, total)) * 100))
-            yield self._cmaf_chunk(
-                request_id,
-                created,
-                f"{CMAF_SEGMENT_PREFIX}{index}",
-                segment,
-                progress,
-            )
 
     async def _encode_image(
         self,

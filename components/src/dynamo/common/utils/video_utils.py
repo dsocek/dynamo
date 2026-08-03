@@ -7,13 +7,14 @@ Provides helpers for parsing video request parameters and encoding numpy
 video frames to MP4 format.
 """
 
+import asyncio
 import io
 import logging
 import os
 import shutil
 import subprocess
 import tempfile
-from typing import Tuple
+from typing import AsyncIterator, Optional, Tuple
 
 import numpy as np
 
@@ -729,3 +730,253 @@ def h264_codec_string_from_init(init: bytes) -> str | None:
         return None
     profile, compat, level = payload[1], payload[2], payload[3]
     return f"avc1.{profile:02x}{compat:02x}{level:02x}"
+
+
+def _next_complete_box(buf: bytearray) -> Optional[Tuple[int, bytes]]:
+    """Peek the first top-level ISO-BMFF box in ``buf`` if it is fully present.
+
+    Returns ``(size, btype)`` when at least ``size`` bytes are buffered, else
+    ``None`` (need more data). The incremental counterpart to
+    :func:`_iter_top_level_boxes`, which requires the whole stream up front.
+    """
+    if len(buf) < 8:
+        return None
+    size = int.from_bytes(buf[0:4], "big")
+    btype = bytes(buf[4:8])
+    header = 8
+    if size == 1:
+        if len(buf) < 16:
+            return None
+        size = int.from_bytes(buf[8:16], "big")
+        header = 16
+    elif size == 0:
+        # "to end of stream" -- never valid for the moof/mdat/ftyp/moov boxes a
+        # fragmented muxer emits over a pipe; treat as not-yet-cuttable.
+        return None
+    if size < header or len(buf) < size:
+        return None
+    return size, btype
+
+
+# ---------------------------------------------------------------------------
+# Live per-request CMAF encoding (persistent ffmpeg session)
+#
+# ``StreamingCmafEncoder`` owns ONE long-lived ffmpeg process for the whole
+# presentation, so the muxer itself owns ``mfhd.sequence_number`` /
+# ``tfdt.baseMediaDecodeTime`` and there is exactly one init segment -- no box
+# surgery. Frames are pushed incrementally; completed CMAF boxes are yielded as
+# they flush. Protocol-neutral: yields ``("init"|"segment", bytes)`` so this
+# layer carries no wire-tag knowledge (that stays in ``cmaf_video``).
+# ---------------------------------------------------------------------------
+
+
+class StreamingCmafEncoder:
+    """Persistent-ffmpeg fragmented-MP4 encoder for live CMAF streaming.
+
+    Lifecycle: :meth:`start` (spawn ffmpeg) -> :meth:`push` per pixel chunk
+    (yields any boxes that flushed) -> :meth:`finish` (close stdin, drain the
+    tail). A background reader task pumps ffmpeg stdout through an incremental
+    box cutter onto a queue; ``push``/``finish`` yield whatever the cutter has
+    completed so far.
+
+    Yields ``(kind, payload)`` where ``kind`` is ``"init"`` (once) or
+    ``"segment"`` (per media fragment). Callers map those to wire tags.
+    """
+
+    def __init__(
+        self,
+        fps: int,
+        width: int,
+        height: int,
+        *,
+        gop_frames: int,
+        hw_accel: Optional[str] = None,
+        device: Optional[str] = None,
+    ) -> None:
+        self.fps = fps
+        self.width = width
+        self.height = height
+        self.gop_frames = max(1, gop_frames)
+        hw = (hw_accel or _video_hw_accel()).lower()
+        if hw == "auto":
+            hw = "xpu" if _running_on_xpu() else "nvenc"
+        self.hw_accel = hw
+        self.device = device or _video_device()
+
+        self._proc: Optional[asyncio.subprocess.Process] = None
+        self._reader_task: Optional[asyncio.Task] = None
+        self._stderr_task: Optional[asyncio.Task] = None
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._buf = bytearray()
+        # Init is everything up to and including ``moov``; accumulate until then.
+        self._init_boxes: list[bytes] = []
+        self._init_emitted = False
+        self._init_bytes: Optional[bytes] = None
+        self._codec_string: Optional[str] = None
+        # Current media fragment being assembled (a ``moof`` + following boxes).
+        self._seg_accum = bytearray()
+        self._stderr = bytearray()
+
+    def _build_argv(self, ffmpeg: str) -> list[str]:
+        encoder = _resolve_ffmpeg_encoder("mp4", "h264", self.hw_accel)
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+        if self.hw_accel == "xpu":
+            cmd += ["-vaapi_device", self.device]
+        cmd += [
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-s", f"{self.width}x{self.height}",
+            "-r", str(self.fps),
+            "-i", "pipe:0",
+        ]
+        if self.hw_accel == "xpu":
+            cmd += ["-vf", "format=nv12,hwupload"]
+        cmd += ["-c:v", encoder]
+        if self.hw_accel == "cpu":
+            # rgb24 -> yuv420p for broad decoder support; closed GOP so each
+            # fragment is independently decodable (VA-API is closed-GOP already).
+            cmd += ["-pix_fmt", "yuv420p", "-flags", "+cgop"]
+        # Deterministic keyframe every gop_frames, no B-frames (no reordering /
+        # cross-fragment prediction), fragment cut at each keyframe -> every
+        # emitted moof begins with an IDR by construction.
+        cmd += [
+            "-bf", "0",
+            "-g", str(self.gop_frames),
+            "-keyint_min", str(self.gop_frames),
+            "-sc_threshold", "0",
+            "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+            "-flush_packets", "1",
+            "-f", "mp4", "pipe:1",
+        ]
+        return cmd
+
+    async def start(self) -> None:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("ffmpeg not found in PATH; required for CMAF streaming")
+        argv = self._build_argv(ffmpeg)
+        logger.info(
+            "StreamingCmafEncoder: %dx%d @ %d fps, gop=%d, hw=%s",
+            self.width, self.height, self.fps, self.gop_frames, self.hw_accel,
+        )
+        self._proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        self._reader_task = asyncio.create_task(self._read_stdout())
+        self._stderr_task = asyncio.create_task(self._read_stderr())
+
+    async def _read_stdout(self) -> None:
+        """Pump ffmpeg stdout -> incremental cutter -> queue until EOF."""
+        assert self._proc is not None and self._proc.stdout is not None
+        while True:
+            chunk = await self._proc.stdout.read(65536)
+            if not chunk:
+                break
+            self._buf.extend(chunk)
+            self._cut_ready_boxes()
+        # EOF: the last fragment has no following moof to close it -- flush it.
+        self._flush_pending_segment()
+        await self._queue.put(None)  # sentinel: no more boxes
+
+    async def _read_stderr(self) -> None:
+        """Drain stderr so a chatty ffmpeg can never block on a full pipe."""
+        assert self._proc is not None and self._proc.stderr is not None
+        while True:
+            chunk = await self._proc.stderr.read(65536)
+            if not chunk:
+                break
+            self._stderr.extend(chunk)
+
+    def _cut_ready_boxes(self) -> None:
+        while True:
+            parsed = _next_complete_box(self._buf)
+            if parsed is None:
+                return
+            size, btype = parsed
+            box = bytes(self._buf[:size])
+            del self._buf[:size]
+            self._handle_box(btype, box)
+
+    def _handle_box(self, btype: bytes, box: bytes) -> None:
+        if not self._init_emitted:
+            self._init_boxes.append(box)
+            if btype == b"moov":
+                init = b"".join(self._init_boxes)
+                self._init_bytes = init
+                self._codec_string = h264_codec_string_from_init(init)
+                self._init_boxes = []
+                self._init_emitted = True
+                self._queue.put_nowait(("init", init))
+            return
+        # Post-init boxes: a ``moof`` opens a new fragment (flush the previous),
+        # everything else (``mdat``, ...) belongs to the fragment in progress.
+        if btype == b"moof":
+            self._flush_pending_segment()
+            self._seg_accum = bytearray(box)
+        else:
+            self._seg_accum.extend(box)
+
+    def _flush_pending_segment(self) -> None:
+        if self._seg_accum:
+            self._queue.put_nowait(("segment", bytes(self._seg_accum)))
+            self._seg_accum = bytearray()
+
+    def _drain_ready(self) -> list[Tuple[str, bytes]]:
+        """Pop every box the cutter has completed so far (non-blocking)."""
+        items: list[Tuple[str, bytes]] = []
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if item is None:  # sentinel only expected in finish()
+                break
+            items.append(item)
+        return items
+
+    async def push(self, frames: np.ndarray) -> AsyncIterator[Tuple[str, bytes]]:
+        """Feed one pixel chunk; yield any CMAF boxes that have since flushed.
+
+        ``frames`` is canonical ``(t, H, W, 3)`` uint8 RGB. Because a fragmented
+        muxer finalizes fragment *k* only when fragment *k+1*'s first frame
+        arrives, boxes returned here typically lag the frames just written by
+        ~one fragment; the tail comes out in :meth:`finish`.
+        """
+        assert self._proc is not None and self._proc.stdin is not None
+        _validate_canonical_frames(frames)
+        self._proc.stdin.write(frames.tobytes())
+        await self._proc.stdin.drain()
+        for item in self._drain_ready():
+            yield item
+
+    async def finish(self) -> AsyncIterator[Tuple[str, bytes]]:
+        """Close stdin and drain the remaining fragment(s) to end-of-stream."""
+        assert self._proc is not None
+        if self._proc.stdin is not None:
+            self._proc.stdin.close()
+        # Consume boxes until the reader signals EOF with its sentinel.
+        while True:
+            item = await self._queue.get()
+            if item is None:
+                break
+            yield item
+        await self._proc.wait()
+        if self._stderr_task is not None:
+            await self._stderr_task
+        if self._proc.returncode:
+            err = bytes(self._stderr).decode("utf-8", errors="replace").strip()
+            raise RuntimeError(
+                f"ffmpeg CMAF session failed (exit {self._proc.returncode}): {err}"
+            )
+
+    def codec_string(self) -> Optional[str]:
+        """RFC 6381 ``avc1.PPCCLL`` parsed from the init segment, else ``None``.
+
+        Available only after the init box has flushed (i.e. after the first
+        ``push`` that produces it). Callers apply their own fallback when
+        ``None`` (the protocol layer owns the fallback constant).
+        """
+        return self._codec_string
