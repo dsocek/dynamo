@@ -6,13 +6,26 @@ from __future__ import annotations
 import argparse
 import http.client
 import http.server
+import json
 import mimetypes
 import sys
+import threading
 import time
+import uuid
 from pathlib import Path
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
 CLIENT_HTML = EXAMPLE_DIR / "client.html"
+VIDEO_ROUTE_PREFIX = "/v1/videos"
+CF_SESSION_PREFIX = "cf_session="
+CF_CLOSE_ANNOTATION = "cf_close"
+DEFAULT_GATE_IDLE_TIMEOUT = 180.0
+# A single scene is seconds, but a stalled one must not pin the gate forever.
+# Bytes flowing refresh this, so it only trips on a genuinely dead stream.
+DEFAULT_GATE_STUCK_TIMEOUT = 120.0
+# Upstream socket ceiling. The old hardcoded 300 s is why an XPU-OOM'd stream
+# left a worker thread parked long enough to pin the gate.
+DEFAULT_UPSTREAM_TIMEOUT = 180.0
 HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -25,6 +38,106 @@ HOP_BY_HOP_HEADERS = {
 }
 
 
+class GpuGate:
+    """One generation at a time, held across a whole cf_session.
+
+    The pipeline is a single DiT worker: two overlapping rollouts contend on the
+    shared-memory broadcast block and can wedge it (observed 2026-08-05 --
+    a second session opened mid-denoise, the loop froze at 18/101 steps, and
+    every later request failed with a 60s acquire_write timeout until restart).
+
+    A per-request flag is not enough. A storyboard is N chained POSTs, so the
+    gate must stay held between scenes -- that gap is exactly where the second
+    caller got in. Ownership is therefore keyed by cf_session id: the scene that
+    opens a session takes the gate, later scenes on that id pass straight
+    through, and cf_close (or an idle timeout, or a dropped connection on the
+    last in-flight scene) releases it.
+    """
+
+    def __init__(
+        self,
+        idle_timeout: float = DEFAULT_GATE_IDLE_TIMEOUT,
+        stuck_timeout: float = DEFAULT_GATE_STUCK_TIMEOUT,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._idle_timeout = idle_timeout
+        self._stuck_timeout = stuck_timeout
+        self._owner: str | None = None
+        self._in_flight = 0
+        self._touched = 0.0
+
+    def _expired_locked(self, now: float) -> bool:
+        """Two ways an owner loses the gate without ever sending cf_close.
+
+        `idle` covers the ordinary abandoned tab: nothing in flight, no next
+        scene. `stuck` is the one that bit us on 2026-08-05 -- the DiT card hit
+        XPU-OOM mid-scene, the viewer walked away, and the proxy worker thread
+        stayed parked on the dead socket. in_flight never fell to 0, so an
+        idle-only check could never fire and the gate was pinned until restart.
+        """
+        if self._owner is None:
+            return False
+        age = now - self._touched
+        if self._in_flight == 0:
+            return age > self._idle_timeout
+        return age > self._stuck_timeout
+
+    def try_acquire(self, session: str | None) -> tuple[bool, str | None, str]:
+        """Return (allowed, owner_token, reason). Non-blocking, so a rejected
+        caller gets an immediate 429 instead of a socket that hangs for minutes."""
+        token = session or f"anon-{uuid.uuid4().hex[:12]}"
+        now = time.monotonic()
+        with self._lock:
+            if self._expired_locked(now):
+                why = "stuck" if self._in_flight else "idle"
+                limit = self._stuck_timeout if self._in_flight else self._idle_timeout
+                sys.stderr.write(
+                    f"[demo-proxy] gate: released {why} session {self._owner} "
+                    f"after {limit:.0f}s (in_flight={self._in_flight})\n"
+                )
+                self._owner = None
+                self._in_flight = 0
+
+            if self._owner is None:
+                self._owner = token
+                self._in_flight = 1
+                self._touched = now
+                return True, token, "acquired"
+
+            if self._owner == token:
+                self._in_flight += 1
+                self._touched = now
+                return True, token, "same-session"
+
+            return False, None, f"busy with session {self._owner}"
+
+    def heartbeat(self, token: str) -> None:
+        """Bytes are still flowing, so this owner is alive, not stuck."""
+        with self._lock:
+            if self._owner == token:
+                self._touched = time.monotonic()
+
+    def finish(self, token: str, release: bool) -> None:
+        with self._lock:
+            if self._owner != token:
+                return
+            self._in_flight = max(0, self._in_flight - 1)
+            self._touched = time.monotonic()
+            if release and self._in_flight == 0:
+                self._owner = None
+
+    def status(self) -> dict:
+        with self._lock:
+            busy = self._owner is not None and not self._expired_locked(
+                time.monotonic()
+            )
+            return {
+                "busy": busy,
+                "session": self._owner if busy else None,
+                "in_flight": self._in_flight,
+            }
+
+
 class DemoProxyServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -34,11 +147,19 @@ class DemoProxyServer(http.server.ThreadingHTTPServer):
         server_address: tuple[str, int],
         frontend_host: str,
         frontend_port: int,
+        gate_idle_timeout: float = DEFAULT_GATE_IDLE_TIMEOUT,
+        gate_stuck_timeout: float = DEFAULT_GATE_STUCK_TIMEOUT,
+        upstream_timeout: float = DEFAULT_UPSTREAM_TIMEOUT,
     ) -> None:
         super().__init__(server_address, DemoProxyHandler)
         self.frontend_host = frontend_host
         self.frontend_port = frontend_port
         self.static_root = EXAMPLE_DIR
+        self.upstream_timeout = upstream_timeout
+        self.gpu_gate = GpuGate(
+            idle_timeout=gate_idle_timeout,
+            stuck_timeout=gate_stuck_timeout,
+        )
 
 
 class DemoProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -60,6 +181,10 @@ class DemoProxyHandler(http.server.BaseHTTPRequestHandler):
     def _handle(self, head_only: bool = False) -> None:
         if self.path == "/" or self.path == "/client.html":
             self._serve_static(CLIENT_HTML, head_only=head_only)
+            return
+
+        if self.path == "/demo/gpu-status":
+            self._send_json(200, self.server.gpu_gate.status())
             return
 
         if self.path.startswith("/v1/") or self.path in {
@@ -95,13 +220,95 @@ class DemoProxyHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", mime_type or "application/octet-stream")
         self.send_header("Content-Length", str(len(body)))
+        # The demo page changes often during a bring-up; a cached copy silently
+        # hides edits (and a corporate proxy will happily serve its own copy).
+        self.send_header("Cache-Control", "no-store, must-revalidate")
         self.end_headers()
         if not head_only:
             self.wfile.write(body)
 
+    def _send_json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    @staticmethod
+    def _inspect_generation_body(body: bytes | None) -> tuple[str | None, bool]:
+        """Pull (cf_session, is_closing) out of a generation request body.
+
+        Unparseable bodies yield (None, True): the request still gets gated, but
+        as a one-shot that releases on completion.
+        """
+        if not body:
+            return None, True
+        try:
+            annotations = (
+                json.loads(body).get("nvext", {}).get("annotations", []) or []
+            )
+        except (ValueError, AttributeError):
+            return None, True
+        strings = [i for i in annotations if isinstance(i, str)]
+        session = None
+        for item in strings:
+            if item.startswith(CF_SESSION_PREFIX):
+                session = item[len(CF_SESSION_PREFIX) :].strip() or None
+        if session is None:
+            # Single-prompt request: one shot, release as soon as it finishes.
+            return None, True
+        # A session-scoped scene keeps the gate until the scene carrying cf_close.
+        return session, CF_CLOSE_ANNOTATION in strings
+
     def _proxy_request(self, head_only: bool = False) -> None:
         content_length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(content_length) if content_length else None
+
+        # Gate only actual generation work; /v1/models and the health routes
+        # must keep answering while a render is in flight.
+        gated = self.command == "POST" and self.path.startswith(VIDEO_ROUTE_PREFIX)
+        token: str | None = None
+        release = True
+        if gated:
+            session, release = self._inspect_generation_body(body)
+            allowed, token, reason = self.server.gpu_gate.try_acquire(session)
+            if not allowed:
+                sys.stderr.write(f"[demo-proxy] gate: rejected 429 -- {reason}\n")
+                self._send_json(
+                    429,
+                    {
+                        "error": {
+                            "message": (
+                                "The demo GPU is already rendering another "
+                                "request. Wait for it to finish and try again."
+                            ),
+                            "type": "gpu_busy",
+                            "code": "gpu_busy",
+                        }
+                    },
+                )
+                return
+
+        try:
+            self._forward(self.path, body, head_only=head_only, token=token)
+        except (TimeoutError, OSError) as exc:
+            # A dead upstream must not leave the caller's socket parked: that is
+            # what pinned the gate on 2026-08-05. Release happens in `finally`.
+            sys.stderr.write(f"[demo-proxy] upstream failed: {exc!r}\n")
+            release = True
+        finally:
+            if token is not None:
+                self.server.gpu_gate.finish(token, release)
+
+    def _forward(
+        self,
+        path: str,
+        body: bytes | None,
+        head_only: bool = False,
+        token: str | None = None,
+    ) -> None:
         upstream_headers = {
             key: value
             for key, value in self.headers.items()
@@ -114,10 +321,10 @@ class DemoProxyHandler(http.server.BaseHTTPRequestHandler):
         conn = http.client.HTTPConnection(
             self.server.frontend_host,
             self.server.frontend_port,
-            timeout=300,
+            timeout=self.server.upstream_timeout,
         )
         try:
-            conn.request(self.command, self.path, body=body, headers=upstream_headers)
+            conn.request(self.command, path, body=body, headers=upstream_headers)
             response = conn.getresponse()
             self.send_response(response.status, response.reason)
             for key, value in response.getheaders():
@@ -136,7 +343,11 @@ class DemoProxyHandler(http.server.BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 self.wfile.flush()
-        except BrokenPipeError:
+                if token is not None:
+                    # Progress means alive: keeps a long but healthy render from
+                    # tripping the stuck-owner timeout.
+                    self.server.gpu_gate.heartbeat(token)
+        except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
             conn.close()
@@ -178,6 +389,29 @@ def create_parser() -> argparse.ArgumentParser:
         default=30.0,
         help="How long to wait for the frontend to respond before serving (default: 30)",
     )
+    parser.add_argument(
+        "--gate-idle-timeout-seconds",
+        type=float,
+        default=DEFAULT_GATE_IDLE_TIMEOUT,
+        help="Release the one-at-a-time GPU gate if a session goes this long "
+        "between scenes, e.g. an abandoned browser tab that never sent cf_close "
+        f"(default: {DEFAULT_GATE_IDLE_TIMEOUT:.0f})",
+    )
+    parser.add_argument(
+        "--gate-stuck-timeout-seconds",
+        type=float,
+        default=DEFAULT_GATE_STUCK_TIMEOUT,
+        help="Release the gate if the owner has a request in flight but no bytes "
+        "have moved for this long, e.g. a render that died on the GPU while the "
+        f"viewer walked away (default: {DEFAULT_GATE_STUCK_TIMEOUT:.0f})",
+    )
+    parser.add_argument(
+        "--upstream-timeout-seconds",
+        type=float,
+        default=DEFAULT_UPSTREAM_TIMEOUT,
+        help="Socket timeout when talking to the frontend "
+        f"(default: {DEFAULT_UPSTREAM_TIMEOUT:.0f})",
+    )
     return parser
 
 
@@ -213,6 +447,9 @@ def main() -> int:
         (args.bind, args.proxy_port),
         frontend_host=args.frontend_host,
         frontend_port=args.frontend_port,
+        gate_idle_timeout=args.gate_idle_timeout_seconds,
+        gate_stuck_timeout=args.gate_stuck_timeout_seconds,
+        upstream_timeout=args.upstream_timeout_seconds,
     )
 
     print()
@@ -220,6 +457,10 @@ def main() -> int:
     print(f"  Browser URL: http://{args.bind}:{args.proxy_port}/")
     print(f"  Proxied frontend: http://{args.frontend_host}:{args.frontend_port}/")
     print("  The browser now sees one origin, so no Dynamo CORS change is needed.")
+    print(
+        f"  One generation at a time; extra callers get HTTP 429 "
+        f"(gate frees after {args.gate_idle_timeout_seconds:.0f}s idle)."
+    )
     print()
 
     try:

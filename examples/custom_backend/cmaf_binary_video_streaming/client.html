@@ -86,11 +86,50 @@
         font-weight: 600;
       }
 
-      .field input {
+      .field input,
+      .field textarea {
         border: 1px solid var(--border);
         border-radius: 12px;
         padding: 11px 12px;
         background: white;
+      }
+
+      .field textarea {
+        min-height: 130px;
+        resize: vertical;
+        font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+        font-size: 0.86rem;
+      }
+
+      /* Drop target for a storyboard JSON file. */
+      .dropzone {
+        border: 2px dashed var(--border);
+        border-radius: 16px;
+        padding: 18px;
+        text-align: center;
+        color: var(--muted);
+        cursor: pointer;
+        transition: border-color 0.15s, background 0.15s;
+      }
+
+      .dropzone.dragover {
+        border-color: var(--accent, #2f9e8f);
+        background: #eef7f5;
+        color: #14343a;
+      }
+
+      .mode-tabs {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .mode-tabs button.active {
+        outline: 3px solid rgba(47, 158, 143, 0.45);
+      }
+
+      .hidden {
+        display: none;
       }
 
       .actions {
@@ -192,24 +231,57 @@
           </div>
           <div class="field">
             <label for="fps">fps</label>
-            <input id="fps" type="number" min="1" step="1" value="16" />
+            <input id="fps" type="number" min="1" step="1" value="8" />
           </div>
           <div class="field">
             <label for="numFrames">num frames</label>
-            <input id="numFrames" type="number" min="17" step="16" value="81" />
+            <input id="numFrames" type="number" min="17" step="16" value="401" />
           </div>
         </div>
         <p class="hint" id="frameHint" style="margin-top: 8px"></p>
         <div class="controls" style="margin-top: 14px">
           <div class="field">
             <label for="model">Model</label>
-            <input id="model" type="text" value="/tmp/mmdis/d/cf/causal-forcing-1step" />
+            <input id="model" type="text" value="/tmp/causal-forcing-1step" />
           </div>
           <div class="field">
             <label for="prompt">Prompt</label>
             <input id="prompt" type="text" value="Dog running on a beach" />
           </div>
         </div>
+
+        <div class="mode-tabs" style="margin-top: 18px">
+          <button id="modeSingle" type="button">Single prompt</button>
+          <button id="modeStory" type="button">Storyboard (multi-scene)</button>
+        </div>
+
+        <!-- Storyboard mode. A storyboard is NOT one request: the wire protocol
+             allows one cf_scene per POST, so N scenes become N chained POSTs
+             sharing one cf_session. The viewer still sees a single continuous
+             MediaSource timeline. -->
+        <div id="storyPanel" class="hidden" style="margin-top: 14px">
+          <div id="dropzone" class="dropzone">
+            <strong>Drop a storyboard .json here</strong><br />
+            or click to pick a file
+            <input id="fileInput" type="file" accept=".json,application/json" class="hidden" />
+          </div>
+          <div class="field" style="margin-top: 14px">
+            <label for="storyText">Storyboard JSON</label>
+            <textarea id="storyText" spellcheck="false"></textarea>
+          </div>
+          <p class="hint" id="storyHint" style="margin-top: 8px"></p>
+          <p class="hint" style="margin-top: 6px">
+            Format:
+            <code>{"board_name": [{"prompt": ..., "latents": 18, "transition": "cut"}, ...]}</code>.
+            <code>latents</code> defaults to 25, <code>transition</code> to
+            <code>cut</code> (or <code>continue</code> to carry the shot on), and
+            an optional <code>seed</code> to 42. Several boards in one file: the
+            first is used and the line above says which. Keep latents &le; 21 —
+            that is the attention window, and nothing server-side rejects a
+            larger value. Resolution is fixed at 832x480.
+          </p>
+        </div>
+
         <div class="actions" style="margin-top: 16px">
           <button id="start">Start CMAF Stream</button>
           <button id="stop">Stop</button>
@@ -220,6 +292,7 @@
           <div class="stat" id="queueStat">Queued: 0</div>
           <div class="stat" id="appendStat">Appended: 0</div>
           <div class="stat" id="audioStat">Audio: unknown</div>
+          <div class="stat" id="sceneStat">Scene: -</div>
         </div>
       </section>
 
@@ -254,7 +327,32 @@
       const queueStat = document.getElementById("queueStat");
       const appendStat = document.getElementById("appendStat");
       const audioStat = document.getElementById("audioStat");
+      const sceneStat = document.getElementById("sceneStat");
       const browserHint = document.getElementById("browserHint");
+      const startBtn = document.getElementById("start");
+      const modeSingleBtn = document.getElementById("modeSingle");
+      const modeStoryBtn = document.getElementById("modeStory");
+      const storyPanel = document.getElementById("storyPanel");
+      const storyText = document.getElementById("storyText");
+      const storyHint = document.getElementById("storyHint");
+      const dropzone = document.getElementById("dropzone");
+      const fileInput = document.getElementById("fileInput");
+
+      // Session-protocol constants, mirroring
+      // components/src/dynamo/vllm/omni/cf_session.py.
+      const CF_SESSION_PREFIX = "cf_session=";
+      const CF_SCENE_PREFIX = "cf_scene=";
+      const CF_CLOSE_ANNOTATION = "cf_close";
+      const BINARY_CMAF_ANNOTATION = "experimental_binary_cmaf";
+      const DEFAULT_LATENTS = 25;
+      const DEFAULT_TRANSITION = "cut";
+      const DEFAULT_SEED = 42;
+
+      let storyboardMode = false;
+      let parsedScenes = null;
+      // True while a storyboard still has scenes to send, so a per-scene DONE
+      // frame does not close the MediaSource on the scenes behind it.
+      let moreScenesPending = false;
 
       let abortController = null;
       let activeReader = null;
@@ -265,6 +363,7 @@
       let appendQueue = [];
       let appendedCount = 0;
       let streamDone = false;
+      let initAppended = false;
       let metadata = null;
       const CONNECT_TIMEOUT_MS = 15000;
 
@@ -399,6 +498,8 @@
         appendQueue = [];
         appendedCount = 0;
         streamDone = false;
+        initAppended = false;
+        moreScenesPending = false;
         metadata = null;
         if (objectUrl) {
           URL.revokeObjectURL(objectUrl);
@@ -410,6 +511,7 @@
         setStat(queueStat, "Queued: 0");
         setStat(appendStat, "Appended: 0");
         setStat(audioStat, "Audio: unknown");
+        setStat(sceneStat, "Scene: -");
       }
 
       function setQueuedStat() {
@@ -457,8 +559,19 @@
         );
       }
 
+      // The queue carries two kinds of item: media bytes to append, and
+      // timeline marks. A mark must be applied at exactly the point in the
+      // byte order where it was issued -- appends are asynchronous, so setting
+      // timestampOffset directly when a scene starts would land on whatever
+      // fragment happened to be in flight.
       function queueAppend(bytes) {
-        appendQueue.push(bytes);
+        appendQueue.push({ kind: "bytes", data: bytes });
+        setQueuedStat();
+        pumpAppendQueue();
+      }
+
+      function queueTimelineOffset(seconds, sceneNumber) {
+        appendQueue.push({ kind: "offset", value: seconds, scene: sceneNumber });
         setQueuedStat();
         pumpAppendQueue();
       }
@@ -466,6 +579,19 @@
       function pumpAppendQueue() {
         if (!sourceBuffer || sourceBuffer.updating) {
           return;
+        }
+        // Marks are synchronous: drain any sitting at the head before the
+        // append behind them, so the offset is in force for those bytes.
+        while (appendQueue.length > 0 && appendQueue[0].kind === "offset") {
+          const mark = appendQueue.shift();
+          try {
+            sourceBuffer.timestampOffset = mark.value;
+            appendLog(
+              `Timeline offset -> ${mark.value.toFixed(2)}s for scene ${mark.scene}`
+            );
+          } catch (error) {
+            appendLog(`Could not set timestampOffset: ${error.message}`, true);
+          }
         }
         if (appendQueue.length === 0) {
           setQueuedStat();
@@ -483,7 +609,7 @@
         const next = appendQueue.shift();
         setQueuedStat();
         try {
-          sourceBuffer.appendBuffer(next);
+          sourceBuffer.appendBuffer(next.data);
         } catch (error) {
           appendLog(`appendBuffer failed: ${error.message}`, true);
         }
@@ -526,8 +652,16 @@
             break;
           }
           case FRAME_KIND.INIT:
-            appendLog(`Received init fragment (${payload.length} bytes)`);
-            queueAppend(payload);
+            // Every chained scene sends its own init fragment. The moov only
+            // needs appending once -- a second one mid-stream re-initializes the
+            // SourceBuffer and resets its timeline, undoing timestampOffset.
+            if (initAppended) {
+              appendLog(`Skipping repeat init fragment (${payload.length} bytes)`);
+            } else {
+              appendLog(`Received init fragment (${payload.length} bytes)`);
+              initAppended = true;
+              queueAppend(payload);
+            }
             break;
           case FRAME_KIND.SEGMENT:
             appendLog(`Received media fragment (${payload.length} bytes)`);
@@ -540,7 +674,14 @@
           }
           case FRAME_KIND.DONE:
             appendLog("Received stream done frame");
-            streamDone = true;
+            // Each chained scene sends its own DONE. Honouring it mid-storyboard
+            // would endOfStream() the buffer and the remaining scenes would have
+            // nowhere to append.
+            if (moreScenesPending) {
+              appendLog("  (more scenes pending -- keeping the buffer open)");
+            } else {
+              streamDone = true;
+            }
             pumpAppendQueue();
             break;
           default:
@@ -548,29 +689,139 @@
         }
       }
 
-      async function startStream() {
-        resetPlaybackState();
+      // --- Storyboard parsing ---------------------------------------------
+      // {"board_name": [{prompt, latents, transition}, ...]} -- a named board of
+      // scene objects. seed is optional per scene. Resolution is fixed, so no
+      // scene carries a size.
+      function normalizeScene(raw, index) {
+        let prompt;
+        let latents = DEFAULT_LATENTS;
+        let transition = DEFAULT_TRANSITION;
+        let seed = DEFAULT_SEED;
 
-        const baseUrl = baseUrlInput.value.trim().replace(/\/$/, "");
-        const url = joinUrl(baseUrl, "/v1/videos/stream/binary/cmaf");
-        // Re-snap before sending so a hand-typed value that never fired a
-        // change event (or an out-of-range one) is still legal.
-        const fps = readFps();
-        const numFrames = legalizeNumFrames(Number.parseFloat(numFramesInput.value));
-        syncFrameFields(numFrames, fps);
-        const body = {
-          model: modelInput.value.trim(),
-          prompt: promptInput.value.trim(),
-          size: "832x480",
-          nvext: {
-            num_frames: numFrames,
-            fps: fps,
-          },
-        };
+        if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+          prompt = raw.prompt;
+          if (raw.latents !== undefined) latents = raw.latents;
+          if (raw.transition !== undefined) transition = raw.transition;
+          if (raw.seed !== undefined) seed = raw.seed;
+        } else {
+          throw new Error(
+            `scene ${index + 1}: expected an object with prompt/latents/transition`
+          );
+        }
 
-        appendLog(`POST ${url}`);
+        if (typeof prompt !== "string" || !prompt.trim()) {
+          throw new Error(`scene ${index + 1}: missing a non-empty prompt`);
+        }
+        latents = Number.parseInt(latents, 10);
+        if (!Number.isFinite(latents) || latents < 1) {
+          throw new Error(`scene ${index + 1}: latents must be a positive integer`);
+        }
+        if (transition !== "cut" && transition !== "continue") {
+          throw new Error(
+            `scene ${index + 1}: transition must be "cut" or "continue", got ${JSON.stringify(transition)}`
+          );
+        }
+        seed = Number.parseInt(seed, 10);
+        if (!Number.isFinite(seed)) {
+          throw new Error(`scene ${index + 1}: seed must be an integer`);
+        }
+        return { prompt: prompt.trim(), latents, transition, seed };
+      }
+
+      // One shape: {"<board name>": [ {prompt, latents, transition}, ... ]}.
+      // A bare array of those scene objects also works, for a quick paste.
+      // Resolution is fixed, so nothing here carries a size.
+      function parseStoryboard(text) {
+        const data = JSON.parse(text);
+        let list;
+        let name = null;
+        let boards = null;
+
+        if (Array.isArray(data)) {
+          list = data;
+        } else if (data && typeof data === "object") {
+          boards = Object.keys(data).filter((k) => Array.isArray(data[k]));
+          if (!boards.length) {
+            throw new Error('expected {"board name": [ ...scenes ]}');
+          }
+          // Several boards in one file: take the first and say which in the hint.
+          name = boards[0];
+          list = data[name];
+        } else {
+          throw new Error("top level must be an object or an array");
+        }
+
+        if (!list.length) throw new Error("storyboard has no scenes");
+        return { scenes: list.map(normalizeScene), name, boards };
+      }
+
+      // A latent decodes to 4 frames and each scene loses 3 to the VAE's
+      // temporal window, so the budget is latents*4-3 PER SCENE.
+      function sceneFrames(scene) {
+        return scene.latents * 4 - 3;
+      }
+
+      function refreshStoryHint() {
+        const text = storyText.value.trim();
+        parsedScenes = null;
+        if (!text) {
+          storyHint.textContent = "";
+          storyHint.classList.remove("danger");
+          return;
+        }
+        try {
+          const { scenes, name, boards } = parseStoryboard(text);
+          parsedScenes = scenes;
+          const frames = scenes.reduce((sum, s) => sum + sceneFrames(s), 0);
+          const fps = readFps();
+          const over = scenes.filter((s) => s.latents > 21).length;
+          const parts = [];
+          if (name) {
+            parts.push(
+              boards.length > 1 ? `"${name}" (of ${boards.length}: ${boards.join(", ")})` : `"${name}"`
+            );
+          }
+          parts.push(`${scenes.length} scenes`);
+          parts.push(`${scenes.reduce((s, x) => s + x.latents, 0)} latents`);
+          parts.push(`${frames} frames`);
+          parts.push(`${(frames / fps).toFixed(1)}s at ${fps} fps`);
+          if (over) {
+            parts.push(`WARNING: ${over} scene(s) exceed 21 latents (attention window)`);
+          }
+          storyHint.textContent = parts.join(" | ");
+          storyHint.classList.toggle("danger", over > 0);
+        } catch (error) {
+          storyHint.textContent = `Invalid storyboard: ${describeError(error)}`;
+          storyHint.classList.add("danger");
+        }
+      }
+
+      function setStoryboardMode(enabled) {
+        storyboardMode = enabled;
+        storyPanel.classList.toggle("hidden", !enabled);
+        modeStoryBtn.classList.toggle("active", enabled);
+        modeSingleBtn.classList.toggle("active", !enabled);
+        // num_frames/duration only describe a single-prompt request; a
+        // storyboard carries its length per scene.
+        numFramesInput.disabled = enabled;
+        secondsInput.disabled = enabled;
+        promptInput.disabled = enabled;
+        if (enabled) refreshStoryHint();
+      }
+
+      function loadStoryboardText(text, label) {
+        storyText.value = text;
+        refreshStoryHint();
+        appendLog(`Loaded storyboard${label ? ` from ${label}` : ""}`);
+      }
+
+      // One POST: send `body`, read the framed binary response to completion.
+      // Returns nothing; it feeds handleFrame() through drainFrames().
+      async function streamOneRequest(url, body, label) {
+        appendLog(`POST ${url}${label ? ` (${label})` : ""}`);
         appendLog(`Waiting for stream response (timeout ${CONNECT_TIMEOUT_MS / 1000}s)`);
-        setStat(modeStat, "Mode: connecting");
+        setStat(modeStat, `Mode: connecting${label ? ` (${label})` : ""}`);
         abortController = new AbortController();
         let connectTimedOut = false;
         const timeoutId = setTimeout(() => {
@@ -591,6 +842,14 @@
           appendLog(`HTTP status: ${response.status}`);
           if (!response.ok) {
             const text = await response.text();
+            if (response.status === 429) {
+              // The demo proxy serialises generation: one request at a time on
+              // one DiT worker. Say so plainly rather than dumping the body.
+              throw new Error(
+                "GPU busy: someone else's render is still running. Wait for it " +
+                  "to finish, then press Start again."
+              );
+            }
             throw new Error(`Request failed with ${response.status}: ${text}`);
           }
           appendLog(
@@ -609,6 +868,7 @@
             }
             drainFrames(value);
           }
+          activeReader = null;
         } catch (error) {
           clearTimeout(timeoutId);
           const errorMessage = describeError(error);
@@ -619,7 +879,7 @@
             );
           } else if (error instanceof TypeError || /failed to fetch/i.test(errorMessage)) {
             appendLog(
-              `Failed to fetch. If client.html is not served from the exact same origin as ${baseUrl}, this minimal branch will usually fail in the browser because it does not enable CORS. The origin must match scheme, host, and port.`,
+              `Failed to fetch. If client.html is not served from the exact same origin as ${new URL(url).origin}, this minimal branch will usually fail in the browser because it does not enable CORS. The origin must match scheme, host, and port.`,
               true
             );
           } else if (error instanceof DOMException && error.name === "AbortError") {
@@ -627,16 +887,170 @@
           } else {
             appendLog(errorMessage, true);
           }
-        } finally {
-          streamDone = true;
-          pumpAppendQueue();
-          setStat(modeStat, "Mode: complete");
+          throw error;
         }
       }
 
+      // The pipeline is one DiT worker: two overlapping runs contend on the
+      // shared-memory broadcast block and can wedge it until a restart. The
+      // proxy enforces this with a 429, but guard here too so an impatient
+      // double-click never becomes a second session in the first place.
+      let streamInFlight = false;
+
+      async function startStream() {
+        if (streamInFlight) {
+          appendLog(
+            "Already streaming -- press Stop first. The demo GPU renders one " +
+              "request at a time.",
+            true
+          );
+          return;
+        }
+        streamInFlight = true;
+        startBtn.disabled = true;
+
+        resetPlaybackState();
+
+        const baseUrl = baseUrlInput.value.trim().replace(/\/$/, "");
+        const url = joinUrl(baseUrl, "/v1/videos/stream/binary/cmaf");
+        const model = modelInput.value.trim();
+        const fps = readFps();
+
+        try {
+          if (storyboardMode) {
+            await startStoryboardStream(url, model, fps);
+          } else {
+            await startSinglePromptStream(url, model, fps);
+          }
+        } catch (_) {
+          // streamOneRequest already logged it; fall through to the finally
+          // block below so the buffer is closed out either way.
+        } finally {
+          // Clear first: a storyboard that failed part-way still has the flag
+          // set, and it would suppress the endOfStream() below and leave the
+          // buffer open forever.
+          moreScenesPending = false;
+          streamDone = true;
+          pumpAppendQueue();
+          setStat(modeStat, "Mode: complete");
+          streamInFlight = false;
+          startBtn.disabled = false;
+        }
+      }
+
+      async function startSinglePromptStream(url, model, fps) {
+        // Re-snap before sending so a hand-typed value that never fired a
+        // change event (or an out-of-range one) is still legal.
+        const numFrames = legalizeNumFrames(Number.parseFloat(numFramesInput.value));
+        syncFrameFields(numFrames, fps);
+        setStat(sceneStat, "Scene: single prompt");
+        await streamOneRequest(url, {
+          model: model,
+          prompt: promptInput.value.trim(),
+          size: "832x480",
+          nvext: {
+            num_frames: numFrames,
+            fps: fps,
+          },
+        });
+      }
+
+      // A storyboard is N chained POSTs, not one request: the worker validates
+      // "one scene per request" and rejects a second cf_scene= annotation. What
+      // makes it one continuous shot is the shared cf_session= id -- that is the
+      // live KV window a "continue" transition attends back into. The viewer
+      // sees one uninterrupted video either way.
+      async function startStoryboardStream(url, model, fps) {
+        refreshStoryHint();
+        const scenes = parsedScenes;
+        if (!scenes || !scenes.length) {
+          appendLog("No valid storyboard loaded -- drop a JSON file or paste one.", true);
+          return;
+        }
+
+        // Unique per run so a re-press does not attach to the previous session's
+        // KV window (which would make scene 1 "continue" from the last take).
+        // performance.now() alone is not enough: it restarts at 0 on reload, so
+        // two runs the same distance after two reloads would collide.
+        const session =
+          `web-${Date.now().toString(36)}` +
+          `-${Math.floor(Math.random() * 1e6).toString(36)}`;
+        appendLog(
+          `Storyboard: ${scenes.length} scenes on session ${session} ` +
+            `(${scenes.length} chained requests, one scene each)`
+        );
+
+        let timelineSeconds = 0;
+        for (let i = 0; i < scenes.length; i += 1) {
+          const scene = scenes[i];
+          const last = i === scenes.length - 1;
+          const frames = sceneFrames(scene);
+          moreScenesPending = !last;
+          setStat(sceneStat, `Scene: ${i + 1}/${scenes.length}`);
+          appendLog(
+            `--- scene ${i + 1}/${scenes.length}: ${scene.latents} latents ` +
+              `(${frames} frames), ${scene.transition}, seed ${scene.seed}`
+          );
+          appendLog(`    ${scene.prompt.slice(0, 120)}`);
+
+          // Every scene's fragments carry their own timeline starting at 0, so
+          // without this the second scene overlaps the first and the decoder
+          // drops the overlap (measured: 162 of 194 frames on two 25-latent
+          // scenes). Push the offset before the scene's bytes.
+          if (i > 0) {
+            queueTimelineOffset(timelineSeconds, i + 1);
+          }
+
+          const annotations = [
+            `${CF_SESSION_PREFIX}${session}`,
+            CF_SCENE_PREFIX +
+              JSON.stringify({
+                transition: scene.transition,
+                latents: scene.latents,
+                seed: scene.seed,
+              }),
+            BINARY_CMAF_ANNOTATION,
+          ];
+          if (last) {
+            // Release the KV window and the VAE temporal cache; without it the
+            // session holds a card until the idle timeout.
+            annotations.push(CF_CLOSE_ANNOTATION);
+          }
+
+          await streamOneRequest(
+            url,
+            {
+              model: model,
+              prompt: scene.prompt,
+              seconds: 1,
+              size: "832x480",
+              nvext: { fps: fps, annotations: annotations },
+            },
+            `scene ${i + 1}/${scenes.length}`
+          );
+
+          timelineSeconds += frames / fps;
+        }
+        appendLog(
+          `Storyboard complete: ${scenes.length} scenes, ` +
+            `${timelineSeconds.toFixed(1)}s of video at ${fps} fps`
+        );
+      }
+
       function stopStream() {
+        const midStoryboard = moreScenesPending;
         resetPlaybackState();
         appendLog("Stopped stream");
+        if (midStoryboard) {
+          // Stopping mid-storyboard skips the cf_close that the last scene
+          // would have carried. There is no close-only request -- closing rides
+          // along with a rendered scene -- so the worker's idle timeout is what
+          // reclaims the KV window. Harmless, just not immediate.
+          appendLog(
+            "Stopped before the final scene, so no cf_close was sent; the worker " +
+              "releases the session on its idle timeout."
+          );
+        }
       }
 
       baseUrlInput.value = inferBaseUrl();
@@ -649,8 +1063,117 @@
         );
       }
 
-      document.getElementById("start").addEventListener("click", startStream);
+      startBtn.addEventListener("click", startStream);
       document.getElementById("stop").addEventListener("click", stopStream);
+
+      // A runnable example, so switching to storyboard mode and pressing Start
+      // works without typing anything. The full coral_reef board: 7 scenes,
+      // 121 latents, 463 frames (~58 s at 8 fps).
+      const EXAMPLE_STORYBOARD = {
+        coral_reef: [
+          {
+            prompt:
+              "A vivid coral reef wall in clear tropical water, filling the frame in ultra-clean 4K. Orange and purple soft corals sway in the current, then a dense school of small silver fish sweeps across the frame as sunlight ripples in bright bands over everything and the camera glides slowly along the wall.",
+            latents: 18,
+            transition: "cut",
+          },
+          {
+            prompt:
+              "The same coral reef wall seen close on a single branching coral head, dominating the frame in ultra-clean 4K. Tiny yellow fish hover between the branches, then dart into cover as a shadow passes and the camera pushes in until the polyp texture fills the screen.",
+            latents: 15,
+            transition: "continue",
+          },
+          {
+            prompt:
+              "A green sea turtle glides over a shallow sandy seabed in bright blue water, filling the foreground in ultra-clean 4K. It sweeps both front flippers in a slow beat, then tips its head down toward a patch of seagrass as sun ripples slide across its patterned shell and the camera tracks alongside.",
+            latents: 21,
+            transition: "cut",
+          },
+          {
+            prompt:
+              "A vast school of sardines forms a shifting silver wall in deep blue open water, dominating the frame in ultra-clean 4K. The mass rolls and folds in on itself, then splits into two curving rivers as light shafts cut down from the surface and the camera holds steady in the gap.",
+            latents: 17,
+            transition: "cut",
+          },
+          {
+            prompt:
+              "A giant manta ray passes overhead against the bright surface of the ocean, filling the frame in ultra-clean 4K. Its wings sweep down in one slow powerful beat, then it banks and turns as its white belly catches the light and the camera looks straight up from below.",
+            latents: 13,
+            transition: "cut",
+          },
+          {
+            prompt:
+              "A kelp forest in cool green light, with tall stalks rising toward the surface, dominating the frame in cinematic 4K. The fronds bend together in a long swell, then a shaft of sunlight swings through the canopy as small fish scatter and the camera drifts slowly upward along the stalks.",
+            latents: 19,
+            transition: "cut",
+          },
+          {
+            prompt:
+              "The same kelp forest near the surface, where the stalks thin into bright green light, filling the frame in cinematic 4K. The canopy parts in a slow swell, then the mirrored underside of the surface fills the top of the frame as the camera keeps rising toward it.",
+            latents: 18,
+            transition: "continue",
+          },
+        ],
+      };
+
+      // --- Storyboard input wiring ----------------------------------------
+      modeSingleBtn.addEventListener("click", () => setStoryboardMode(false));
+      modeStoryBtn.addEventListener("click", () => setStoryboardMode(true));
+      storyText.addEventListener("input", refreshStoryHint);
+      // A storyboard's length is per-scene, but the hint reports its duration
+      // at the current fps, so re-render when fps changes.
+      fpsInput.addEventListener("change", () => {
+        if (storyboardMode) refreshStoryHint();
+      });
+
+      function readDroppedFile(file) {
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => loadStoryboardText(String(reader.result), file.name);
+        reader.onerror = () =>
+          appendLog(`Could not read ${file.name}: ${reader.error}`, true);
+        reader.readAsText(file);
+      }
+
+      dropzone.addEventListener("click", () => fileInput.click());
+      fileInput.addEventListener("change", () => {
+        readDroppedFile(fileInput.files && fileInput.files[0]);
+        // Clear so re-picking the same file fires change again.
+        fileInput.value = "";
+      });
+
+      // dragover must preventDefault on every event, not just dragenter, or the
+      // browser keeps its default "navigate to the file" behaviour on drop.
+      ["dragenter", "dragover"].forEach((name) => {
+        dropzone.addEventListener(name, (event) => {
+          event.preventDefault();
+          dropzone.classList.add("dragover");
+        });
+      });
+      ["dragleave", "dragend"].forEach((name) => {
+        dropzone.addEventListener(name, () => dropzone.classList.remove("dragover"));
+      });
+      dropzone.addEventListener("drop", (event) => {
+        event.preventDefault();
+        dropzone.classList.remove("dragover");
+        const dt = event.dataTransfer;
+        if (!dt) return;
+        if (dt.files && dt.files.length) {
+          readDroppedFile(dt.files[0]);
+          return;
+        }
+        // Dragging a JSON selection out of an editor gives text, not a file.
+        const text = dt.getData("text");
+        if (text) loadStoryboardText(text, "dropped text");
+      });
+
+      // Dropping anywhere else on the page would otherwise navigate away and
+      // lose whatever the user had typed.
+      window.addEventListener("dragover", (event) => event.preventDefault());
+      window.addEventListener("drop", (event) => event.preventDefault());
+
+      storyText.value = JSON.stringify(EXAMPLE_STORYBOARD, null, 2);
+      setStoryboardMode(false);
     </script>
   </body>
 </html>
