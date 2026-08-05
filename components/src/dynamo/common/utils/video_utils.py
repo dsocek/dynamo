@@ -11,9 +11,11 @@ import asyncio
 import io
 import logging
 import os
+import queue
 import shutil
 import subprocess
 import tempfile
+import threading
 from typing import AsyncIterator, Optional, Tuple
 
 import numpy as np
@@ -708,6 +710,273 @@ def split_fragmented_mp4(data: bytes) -> Tuple[bytes, list[bytes]]:
         data[boundaries[i] : boundaries[i + 1]] for i in range(len(boundaries) - 1)
     ]
     return init, segments
+
+
+def iter_fragmented_mp4_boxes(data: bytes) -> Tuple[list[Tuple[bytes, bytes]], bytes]:
+    """Split a byte run into complete top-level boxes plus an unconsumed tail.
+
+    The incremental counterpart to :func:`split_fragmented_mp4`, which needs the
+    whole stream up front. Returns ``([(type, bytes), ...], remainder)`` where
+    ``remainder`` is a partial box that has not fully arrived yet and must be
+    prepended to the next read.
+
+    Pure container parsing, so it is encoder-agnostic like its batch sibling.
+    """
+    boxes: list[Tuple[bytes, bytes]] = []
+    off = 0
+    n = len(data)
+    while off + 8 <= n:
+        size = int.from_bytes(data[off : off + 4], "big")
+        btype = data[off + 4 : off + 8]
+        header = 8
+        if size == 1:
+            if off + 16 > n:
+                break
+            size = int.from_bytes(data[off + 8 : off + 16], "big")
+            header = 16
+        elif size == 0:
+            # "to end of stream" -- meaningless mid-stream, since more may follow.
+            break
+        if size < header:
+            break
+        if off + size > n:
+            break  # box announced but not fully arrived
+        boxes.append((btype, data[off : off + size]))
+        off += size
+    return boxes, data[off:]
+
+
+def encode_video_fragments(
+    frame_chunks,
+    fps: int = DEFAULT_VIDEO_FPS,
+    *,
+    codec: str | None = None,
+    hw_accel: str | None = None,
+    device: str | None = None,
+    gop_seconds: int = 2,
+    width: int | None = None,
+    height: int | None = None,
+):
+    """Encode an *iterable of frame chunks* into fMP4 pieces, yielding as they emerge.
+
+    The streaming counterpart to :func:`encode_video`. Yields ``("init", bytes)``
+    once, then ``("segment", bytes)`` per media fragment, as soon as the encoder
+    produces each one -- so a caller can ship segment 0 to a client while later
+    frames are still being generated.
+
+    This is possible because ffmpeg muxes ``+empty_moov+frag_keyframe`` without
+    seeking back to patch a ``moov`` atom, so the output is valid on a pipe.
+    :func:`encode_video` writes to a temp file instead and therefore cannot
+    return anything until the process exits; that difference, not the encoder
+    settings, is what makes this incremental.
+
+    Args:
+        frame_chunks: Iterable of canonical ``(T, H, W, 3) uint8`` RGB arrays.
+            Chunk boundaries need not align with segment boundaries; ``T`` may
+            differ per chunk. An empty iterable raises ``RuntimeError``.
+        fps: Frames per second of the output.
+        codec / hw_accel / device: As :func:`encode_video`. ``hw_accel="nvenc"``
+            is honored here (unlike the imageio path, which cannot fragment).
+        gop_seconds: Keyframe interval, hence approximate segment duration.
+        width / height: Frame geometry. Inferred from the first chunk when
+            omitted; pass them to start ffmpeg before the first chunk exists.
+
+    Yields:
+        ``(kind, payload)`` where ``kind`` is ``"init"`` or ``"segment"``.
+
+    Raises:
+        RuntimeError: If ffmpeg is missing, exits nonzero, produces no init
+            segment, or is fed no frames at all.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found in PATH; required for video encoding")
+
+    hw_accel = (hw_accel or _video_hw_accel()).lower()
+    if hw_accel == "auto":
+        hw_accel = "xpu" if _running_on_xpu() else "nvenc"
+    if hw_accel not in _FFMPEG_ENCODERS:
+        raise ValueError(
+            f"Unsupported hw_accel {hw_accel!r}; "
+            f"supported: {sorted(_FFMPEG_ENCODERS)} (or 'auto')"
+        )
+    encoder = _resolve_ffmpeg_encoder("mp4", codec or "h264", hw_accel)
+    device = device or _video_device()
+    gop_seconds = max(1, int(gop_seconds))
+
+    chunks = iter(frame_chunks)
+    first = next(chunks, None)
+    if first is None:
+        raise RuntimeError("encode_video_fragments got no frame chunks")
+    _validate_canonical_frames(first)
+    if width is None or height is None:
+        height, width = first.shape[1], first.shape[2]
+
+    gop = max(1, gop_seconds * fps)
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+    if hw_accel == "xpu":
+        cmd += ["-vaapi_device", device]
+    cmd += [
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(fps),
+        "-i",
+        "-",
+    ]
+    if hw_accel == "xpu":
+        cmd += ["-vf", "format=nv12,hwupload"]
+    cmd += ["-c:v", encoder]
+    if hw_accel == "cpu":
+        cmd += ["-pix_fmt", "yuv420p"]
+    cmd += [
+        "-g",
+        str(gop),
+        "-keyint_min",
+        str(gop),
+        "-sc_threshold",
+        "0",
+        "-force_key_frames",
+        f"expr:gte(t,n_forced*{gop_seconds})",
+        # No +faststart and no seeking: this is what makes a pipe viable.
+        "-movflags",
+        "+frag_keyframe+empty_moov+default_base_moof",
+        "-f",
+        "mp4",
+        "pipe:1",
+    ]
+
+    logger.info(
+        "Streaming-encoding %dx%d @ %d fps via %s on %s (gop=%ds)",
+        width,
+        height,
+        fps,
+        encoder,
+        device if hw_accel == "xpu" else hw_accel,
+        gop_seconds,
+    )
+
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+
+    # stdout must be drained continuously. Writing frames while the output pipe
+    # sits full deadlocks: ffmpeg blocks on write, we block on write, neither
+    # side drains. A reader thread decouples the two directions.
+    out_q: "queue.Queue[bytes | None]" = queue.Queue()
+
+    def _drain() -> None:
+        try:
+            while True:
+                buf = proc.stdout.read(65536)
+                if not buf:
+                    break
+                out_q.put(buf)
+        finally:
+            out_q.put(None)
+
+    reader = threading.Thread(target=_drain, daemon=True)
+    reader.start()
+
+    err_chunks: list[bytes] = []
+    err_reader = threading.Thread(
+        target=lambda: err_chunks.append(proc.stderr.read()), daemon=True
+    )
+    err_reader.start()
+
+    pending = b""  # bytes of a box that has not fully arrived
+    init_parts: list[bytes] = []  # ftyp/moov, accumulated until moov closes it
+    init_done = False
+    moof = None  # a moof waiting for its mdat
+    writer_failed: list[BaseException] = []
+
+    def _write_frames() -> None:
+        try:
+            chunk = first
+            while chunk is not None:
+                _validate_canonical_frames(chunk)
+                if chunk.shape[1] != height or chunk.shape[2] != width:
+                    raise ValueError(
+                        f"frame chunk geometry {chunk.shape[2]}x{chunk.shape[1]} does "
+                        f"not match the stream's {width}x{height}"
+                    )
+                proc.stdin.write(np.ascontiguousarray(chunk).tobytes())
+                chunk = next(chunks, None)
+            proc.stdin.flush()
+        except BaseException as e:  # noqa: BLE001 -- re-raised on the main thread
+            writer_failed.append(e)
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    writer = threading.Thread(target=_write_frames, daemon=True)
+    writer.start()
+
+    def _classify(btype: bytes, raw: bytes):
+        """Turn one top-level box into an emittable piece, or None."""
+        nonlocal init_done, moof
+        if not init_done:
+            init_parts.append(raw)
+            if btype == b"moov":
+                init_done = True
+                return ("init", b"".join(init_parts))
+            return None
+        if btype == b"moof":
+            moof = raw
+            return None
+        if moof is not None:
+            # A media segment is moof + its following data box.
+            segment, moof = moof + raw, None
+            return ("segment", segment)
+        # mfra (fragment index) and free space trail the media; MSE ignores
+        # them and appending them would only confuse a SourceBuffer.
+        return None
+
+    try:
+        while True:
+            buf = out_q.get()
+            if buf is None:
+                break
+            pending += buf
+            boxes, pending = iter_fragmented_mp4_boxes(pending)
+            for btype, raw in boxes:
+                piece = _classify(btype, raw)
+                if piece is not None:
+                    yield piece
+
+        writer.join(timeout=30)
+        reader.join(timeout=30)
+        proc.wait(timeout=60)
+        err_reader.join(timeout=5)
+
+        if writer_failed:
+            raise writer_failed[0]
+        if proc.returncode != 0:
+            stderr = b"".join(err_chunks).decode("utf-8", errors="replace").strip()
+            raise RuntimeError(
+                f"ffmpeg {encoder} streaming encode failed "
+                f"(exit {proc.returncode}): {stderr}"
+            )
+        if not init_done:
+            raise RuntimeError(
+                "streaming encode produced no init segment (no moov box); "
+                f"ffmpeg said: "
+                f"{b''.join(err_chunks).decode('utf-8', errors='replace').strip()!r}"
+            )
+    finally:
+        # A consumer that stops early (client disconnect) must not leak ffmpeg.
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
 
 
 def h264_codec_string_from_init(init: bytes) -> str | None:

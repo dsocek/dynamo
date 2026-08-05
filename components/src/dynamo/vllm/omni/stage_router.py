@@ -3,12 +3,14 @@
 
 """Stage router for disaggregated omni pipelines."""
 
+import asyncio
 import json
 import logging
 import time
 import uuid
 from typing import Any, AsyncGenerator, Dict, List
 
+import numpy as np
 from vllm_omni.distributed.omni_connectors import initialize_orchestrator_connectors
 
 from dynamo import prometheus_names
@@ -23,6 +25,8 @@ from dynamo.llm import ModelInput, WorkerType, register_model
 from dynamo.runtime import DistributedRuntime
 from dynamo.vllm.main import setup_metrics_collection
 from dynamo.vllm.omni.args import OmniConfig
+from dynamo.vllm.omni.cf_pipeline import FrameQueue, Relay, cf_put_key
+from dynamo.vllm.omni.cf_session import has_cf_session
 from dynamo.vllm.omni.cmaf_video import (
     CMAF_ANNOTATION,
     CMAF_FALLBACK_VIDEO_CODEC,
@@ -50,7 +54,7 @@ from dynamo.vllm.omni.utils import (
     shm_deserialize,
     unwrap_connector_payload,
 )
-from dynamo.vllm.omni.video_convert import to_canonical
+from dynamo.vllm.omni.video_convert import decoded_chunk_to_canonical, to_canonical
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +125,24 @@ class OmniStageRouter:
         context,  # noqa: ARG002 — context unused; router generates its own request_id
     ) -> AsyncGenerator[dict, None]:
         request_id = str(uuid.uuid4())
+
+        # Causal-Forcing session streaming, dispatched before request parsing: the
+        # streaming path never consults request_type -- a session is video by
+        # construction -- so parsing first would only add a way for it to fail.
+        if has_cf_session(request.get("nvext")):
+            # Closed explicitly rather than left to ``async for``: when the client
+            # disconnects, closing *this* generator does not close the one it is
+            # delegating to -- an async generator's cleanup otherwise waits for the
+            # event loop's finalizer, and until it runs the stream's two producer
+            # tasks are still alive with nobody draining them.
+            cf_stream = self._generate_cf_stream(request, request_id)
+            try:
+                async for chunk in cf_stream:
+                    yield chunk
+            finally:
+                await cf_stream.aclose()
+            return
+
         _, request_type = parse_request_type(request, self.config.output_modalities)
 
         # Binary CMAF live streaming: when the request is CMAF-annotated video,
@@ -414,6 +436,188 @@ class OmniStageRouter:
         # generator closes (§9). request_type is accepted for symmetry with the
         # batch path; the CMAF wire contract is modality-fixed.
         _ = request_type
+    # -- Causal-Forcing pipelined streaming ---------------------------------
+
+    async def _generate_cf_stream(
+        self, request: dict, request_id: str
+    ) -> AsyncGenerator[dict, None]:
+        """Run a session request as three overlapping stages instead of three phases.
+
+        The serial path above is correct and is what a one-shot request wants: each
+        stage's whole output is the next stage's whole input, so waiting is not
+        waste. A rollout is different. It produces blocks, and a block is
+        independently decodable and independently encodable, so DiT block N+1,
+        VAE block N and the encoder's block N-1 can all be in flight at once.
+        Measured per-latent cost is 0.957 s of DiT and 1.290 s of VAE; run serially
+        that is their sum, pipelined it is the max, and the encoder disappears
+        under both.
+
+        Three concurrent tasks, chained by the handoffs in :mod:`cf_pipeline`::
+
+            rollout ──Relay──> decode ──FrameQueue──> encoder thread ──> client
+
+        The decode task is the one that has to stay strictly ordered: the VAE's
+        temporal ``feat_cache`` makes block N's first frame depend on block N-1's
+        last, so it awaits each block in turn. Reordering there would not fail --
+        it would produce visible seams. The rollout ahead of it and the encoder
+        behind it are free to run as fast as they can.
+        """
+        if len(self.stage_configs) < 2:
+            yield {
+                "error": "Causal-Forcing session streaming needs the 2-stage "
+                "(DiT + VAE) disaggregated pipeline",
+                "finished": True,
+            }
+            return
+
+        dit_stage, vae_stage = self.stage_configs[0], self.stage_configs[1]
+        dit_client = self.stage_clients.get(
+            getattr(dit_stage.engine_args, "model_stage", "stage0")
+        )
+        vae_client = self.stage_clients.get(
+            getattr(vae_stage.engine_args, "model_stage", "stage1")
+        )
+        if dit_client is None or vae_client is None:
+            yield {
+                "error": "Missing stage client for the CF pipeline",
+                "finished": True,
+            }
+            return
+
+        nvext = request.get("nvext") or {}
+        fps = int(nvext.get("fps") or self.config.default_video_fps)
+        cmaf = CMAF_ANNOTATION in (nvext.get("annotations") or [])
+
+        blocks = Relay()
+        frames = FrameQueue()
+
+        async def rollout() -> None:
+            """Stage 0: forward each emitted block to the decode task as it lands."""
+            try:
+                async for output in self._stage_chunks(
+                    dit_client, {"request_id": request_id, **request}
+                ):
+                    if output.error:
+                        raise RuntimeError(f"DiT stage: {output.error}")
+                    await blocks.put(output)
+                    if output.cf_last:
+                        break
+            except BaseException as e:  # noqa: BLE001 -- re-raised in the consumer
+                blocks.close(e)
+            else:
+                blocks.close()
+
+        async def decode() -> None:
+            """Stage 1: decode blocks in order, feeding the encoder as it goes."""
+            try:
+                async for output in blocks:
+                    stage_request = output.to_next_stage_request(request_id)
+                    if output.cf_last:
+                        # Forwarded so the VAE worker releases its decode cursor;
+                        # it produces no frames, so nothing is queued for it.
+                        async for _ in self._stage_chunks(vae_client, stage_request):
+                            pass
+                        break
+                    decoded = await self._fetch_cf_block(
+                        vae_client, stage_request, request_id
+                    )
+                    frames.put(decoded_chunk_to_canonical(decoded))
+            except BaseException as e:  # noqa: BLE001 -- re-raised in the consumer
+                frames.close(e)
+            else:
+                frames.close()
+
+        rollout_task = asyncio.create_task(rollout())
+        decode_task = asyncio.create_task(decode())
+        try:
+            if cmaf:
+                # The live formatter reports its own failures as a CMAF failure
+                # frame, because by then the client already holds a partial asset
+                # and needs to be told it is partial rather than complete.
+                async for chunk in self._formatter.stream_video_cmaf_live(
+                    frames, request_id, fps=fps
+                ):
+                    yield chunk
+            else:
+                # No CMAF opt-in: collect the stream and answer as one clip. The
+                # pipelining still applies -- only the delivery is batched.
+                try:
+                    collected = await asyncio.to_thread(list, frames)
+                except Exception as e:
+                    # A producer's terminal error, re-raised here by the handoff.
+                    # It has to become a chunk: an exception out of this generator
+                    # would reach the client as a dropped connection, which is
+                    # indistinguishable from a network fault.
+                    logger.error("CF stream failed for %s: %s", request_id, e)
+                    yield {"error": str(e), "finished": True}
+                    return
+                if not collected:
+                    yield {"error": "CF stream produced no frames", "finished": True}
+                    return
+                chunk = await self._formatter.format_video_frames(
+                    [np.concatenate(collected, axis=0)], request_id, fps=fps
+                )
+                if chunk:
+                    yield chunk
+        finally:
+            # The consumer may have stopped early (client disconnect), which leaves
+            # both producers blocked on a handoff nobody will drain again.
+            for task in (rollout_task, decode_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(rollout_task, decode_task, return_exceptions=True)
+
+    async def _stage_chunks(
+        self, client: Any, stage_request: dict
+    ) -> AsyncGenerator[StageOutput, None]:
+        """Yield a stage's outputs one at a time rather than merging them.
+
+        The serial path collapses a stage's chunks with ``dict.update`` because a
+        one-shot stage emits exactly one. A pipelined stage emits one per block,
+        and merging them would keep only the last -- silently, since each chunk is
+        individually well-formed.
+        """
+        async for chunk in await client.round_robin(stage_request):
+            data = chunk.data()
+            if isinstance(data, (str, bytes)):
+                data = json.loads(data)
+            yield StageOutput.model_validate(data)
+
+    async def _fetch_cf_block(
+        self, client: Any, stage_request: dict, request_id: str
+    ) -> Any:
+        """Send one block to the VAE stage and read the decoded frames back."""
+        block = stage_request.get("cf_block", 0)
+        last: StageOutput | None = None
+        async for output in self._stage_chunks(client, stage_request):
+            if output.error:
+                raise RuntimeError(f"VAE stage, block {block}: {output.error}")
+            last = output
+        if last is None:
+            raise RuntimeError(f"VAE stage returned nothing for block {block}")
+
+        final_stage_id = self.stage_configs[-1].stage_id
+        connector = self.connectors.get(_connector_key(final_stage_id, "router"))
+        metadata = (last.stage_connector_refs or {}).get(str(final_stage_id))
+        if connector is None or metadata is None:
+            raise RuntimeError(
+                f"block {block}: the VAE stage produced no router connector ref; a "
+                "pipelined stream cannot use the SHM-by-request-id fallback, since "
+                "every block would collide on one key"
+            )
+        payload = unwrap_connector_payload(
+            await ensure_awaited(
+                connector.get(
+                    str(final_stage_id),
+                    "router",
+                    cf_put_key(request_id, block),
+                    metadata=metadata,
+                )
+            )
+        )
+        if is_empty_payload(payload):
+            raise RuntimeError(f"block {block}: empty payload from the VAE stage")
+        return payload
 
     async def _format_output(
         self,

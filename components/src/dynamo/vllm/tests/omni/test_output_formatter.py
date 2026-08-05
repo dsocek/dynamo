@@ -227,7 +227,7 @@ class TestDiffusionFormatterVideo:
 
         f = _make_diffusion_formatter()
         with patch(
-            "dynamo.vllm.omni.output_formatter.normalize_video_frames",
+            "dynamo.vllm.omni.output_formatter.to_canonical",
             side_effect=RuntimeError("boom"),
         ):
             chunk = await f._encode_video([MagicMock()], "req-1", fps=16)
@@ -530,10 +530,14 @@ class TestDiffusionFormatterVideoOutputFormat:
 
         return (
             _patch(
-                "dynamo.vllm.omni.output_formatter.normalize_video_frames",
-                return_value=[MagicMock()],
+                "dynamo.vllm.omni.output_formatter.to_canonical",
+                return_value=MagicMock(),
             ),
-            _patch("dynamo.vllm.omni.output_formatter.export_to_video"),
+            # Bytes, not a bare Mock: the b64_json branch base64-encodes this.
+            _patch(
+                "dynamo.vllm.omni.output_formatter.encode_video",
+                return_value=b"fake-mp4",
+            ),
             _patch(
                 "dynamo.vllm.omni.output_formatter.upload_to_fs",
                 return_value="http://x/v.mp4",

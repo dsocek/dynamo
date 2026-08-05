@@ -37,11 +37,55 @@ from dynamo.vllm.omni.cmaf_video import (
     cmaf_gop_frames,
     cmaf_segment_seconds,
     metadata_bytes,
+    stream_frames_to_cmaf,
 )
 from dynamo.vllm.omni.utils import is_empty_payload
 from dynamo.vllm.omni.video_convert import to_canonical
 
 logger = logging.getLogger(__name__)
+
+_FRAGMENTS_DONE = object()
+
+
+class _AsyncFragments:
+    """Adapts a blocking fragment generator to ``async for``, one step per thread hop.
+
+    The encoder generator blocks on a subprocess pipe. Iterating it directly on
+    the event loop would stall every other request in this worker for the whole
+    encode -- which in a streaming deploy is unbounded. Each ``next()`` therefore
+    runs via :func:`asyncio.to_thread`.
+
+    One step at a time rather than a producer thread with a queue, deliberately:
+    the generator is only ever touched by one thread at a time, so there is no
+    shared mutable state to get wrong, and back-pressure stays natural -- nothing
+    is encoded ahead of what the client has taken. The cost is a thread hop per
+    segment, which is nothing against encoding one.
+    """
+
+    def __init__(self, generator) -> None:
+        self._gen = generator
+        self._closed = False
+
+    def __aiter__(self) -> "_AsyncFragments":
+        return self
+
+    async def __anext__(self):
+        item = await asyncio.to_thread(next, self._gen, _FRAGMENTS_DONE)
+        if item is _FRAGMENTS_DONE:
+            raise StopAsyncIteration
+        return item
+
+    async def aclose(self) -> None:
+        """Close the generator so its cleanup runs (it reaps the encoder process).
+
+        Idempotent, and safe to call after exhaustion -- ``stream_video_cmaf``
+        calls it from a ``finally``, where the normal-completion path has already
+        run the generator to the end.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        await asyncio.to_thread(self._gen.close)
 
 
 class TextFormatter:
@@ -212,21 +256,136 @@ class DiffusionFormatter:
             ],
         ).model_dump()
 
+    def _cmaf_failure(
+        self, request_id: str, created: int, error: str
+    ) -> Dict[str, Any]:
+        return NvVideosResponse(
+            id=request_id,
+            object="video",
+            model=self._model_name,
+            status="failed",
+            progress=0,
+            created=created,
+            data=[],
+            error=error,
+        ).model_dump()
+
     async def stream_video_cmaf(
         self, stage_output: Any, request_id: str, *, fps: int
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Encode a generated clip through a persistent ffmpeg, streaming CMAF.
+        """Encode a generated clip incrementally, streaming CMAF as it emerges.
 
         Yields a ``cmaf:metadata`` item, then ``cmaf:init``, then one
-        ``cmaf:segment:{n}`` item per fMP4 media fragment as the muxer flushes
-        them. The frontend's binary-CMAF route re-frames these into a single
-        binary response body. Non-final stage outputs (empty payloads) yield
-        nothing.
+        ``cmaf:segment:{n}`` item per fMP4 media fragment. The frontend's
+        binary-CMAF route re-frames these into a single binary response body.
+        Non-final stage outputs (empty payloads) yield nothing.
 
-        Step 2 posture: generation is still batch (the whole clip arrives here at
-        once), but it is fed through ``StreamingCmafEncoder`` in one ``push`` so
-        the *wire behavior* -- streamed segments, ``segment_count=None``, codec
-        parsed from the live init -- already matches the future per-chunk path.
+        Pieces are emitted **as the encoder produces them** rather than after the
+        whole clip is packaged, so the client can start decoding on segment 0.
+        The frames still arrive here in one batch today -- the router hands the
+        formatter a single finished ``StageOutput`` -- so what this removes is
+        only the encode+split tail (~0.5 s of a ~55 s request). It matters
+        because it is the half that has to exist first: once a session rollout
+        feeds frames chunk by chunk, this same path ships segment 0 while the
+        later frames are still being generated, with no further change here.
+
+        Because the total is unknown while encoding, the metadata frame declares
+        an open-ended stream and progress cannot be a true percentage -- see
+        :meth:`_cmaf_progress`.
+
+        :meth:`stream_video_cmaf_persistent` is the alternative encoder for this
+        same wire protocol -- one long-lived ffmpeg instead of a per-call
+        fragment generator. See its docstring for when each is preferable.
+        """
+        images = (
+            stage_output.images if hasattr(stage_output, "images") else stage_output
+        )
+        if is_empty_payload(images):
+            return
+
+        created = int(time.time())
+        try:
+            canonical = to_canonical(images)
+        except Exception as e:
+            logger.error("Failed to convert frames for request %s: %s", request_id, e)
+            yield self._cmaf_failure(request_id, created, str(e))
+            return
+
+        segment_seconds = cmaf_segment_seconds()
+        cadence = cmaf_emit_cadence_s()
+        # Known here only because the frames arrive whole; a live rollout would
+        # not know it, which is exactly why the protocol carries open_ended.
+        expected = self._expected_segments(len(canonical), fps, segment_seconds)
+
+        pieces = _AsyncFragments(
+            stream_frames_to_cmaf(
+                self._frame_chunks(canonical, fps, segment_seconds),
+                fps,
+                segment_seconds,
+            )
+        )
+        emitted = 0
+        try:
+            async for kind, payload, extra in pieces:
+                if kind == "init":
+                    yield self._cmaf_chunk(
+                        request_id,
+                        created,
+                        CMAF_METADATA_TAG,
+                        metadata_bytes(None, segment_seconds, extra),
+                        progress=0,
+                    )
+                    yield self._cmaf_chunk(
+                        request_id, created, CMAF_INIT_TAG, payload, progress=1
+                    )
+                    continue
+                if cadence > 0:
+                    await asyncio.sleep(cadence)
+                emitted += 1
+                yield self._cmaf_chunk(
+                    request_id,
+                    created,
+                    f"{CMAF_SEGMENT_PREFIX}{extra}",
+                    payload,
+                    self._cmaf_progress(emitted, expected),
+                )
+        except Exception as e:
+            # A mid-stream failure has already sent init and possibly segments,
+            # so the client holds a partial but valid asset. Say so rather than
+            # letting the stream just stop, which is indistinguishable from a
+            # completed short clip.
+            logger.error(
+                "CMAF streaming failed for request %s after %d segment(s): %s",
+                request_id,
+                emitted,
+                e,
+            )
+            yield self._cmaf_failure(request_id, created, str(e))
+            return
+        finally:
+            await pieces.aclose()
+
+        logger.info("CMAF stream for %s complete: %d segment(s)", request_id, emitted)
+
+    async def stream_video_cmaf_persistent(
+        self, stage_output: Any, request_id: str, *, fps: int
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """:meth:`stream_video_cmaf` over one long-lived ffmpeg process.
+
+        Identical wire output; different encoder ownership. The default path
+        drives :func:`encode_video_fragments`, a generator that owns an ffmpeg
+        for the duration of one call -- simple, and it back-pressures naturally
+        because nothing is encoded ahead of what the consumer has taken.
+        ``StreamingCmafEncoder`` instead keeps a process alive across pushes, so
+        the muxer -- not us -- owns ``mfhd.sequence_number`` and
+        ``tfdt.baseMediaDecodeTime`` across the whole presentation, and there is
+        exactly one init segment no matter how many pushes arrive.
+
+        That property is what a *multi-request* stream needs: many pushes, one
+        continuous timeline. It is unused by the router today, which gets its
+        continuity from a single generator per presentation instead, so this
+        stays available rather than default -- there is no reason to prefer a
+        persistent subprocess when one call has all the frames.
         """
         images = (
             stage_output.images if hasattr(stage_output, "images") else stage_output
@@ -239,9 +398,7 @@ class DiffusionFormatter:
         try:
             canonical = to_canonical(images)
             height, width = canonical.shape[1], canonical.shape[2]
-            enc = StreamingCmafEncoder(
-                fps, width, height, gop_frames=cmaf_gop_frames()
-            )
+            enc = StreamingCmafEncoder(fps, width, height, gop_frames=cmaf_gop_frames())
             await enc.start()
 
             seg_index = 0
@@ -285,17 +442,122 @@ class DiffusionFormatter:
                     yield chunk
         except Exception as e:
             logger.error("Failed to stream CMAF for request %s: %s", request_id, e)
-            yield NvVideosResponse(
-                id=request_id,
-                object="video",
-                model=self._model_name,
-                status="failed",
-                progress=0,
-                created=created,
-                data=[],
-                error=str(e),
-            ).model_dump()
+            yield self._cmaf_failure(request_id, created, str(e))
             return
+
+        logger.info(
+            "Persistent CMAF stream for %s complete: %d segment(s)",
+            request_id,
+            seg_index,
+        )
+
+    async def stream_video_cmaf_live(
+        self, frame_chunks: Any, request_id: str, *, fps: int
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Stream binary-CMAF pieces from frames that are still being generated.
+
+        Same wire protocol as :meth:`stream_video_cmaf`, and the same encoder --
+        the only difference is where the frames come from. There, they arrive as
+        one finished clip, so the segment count is known and only the encode tail
+        overlaps generation. Here ``frame_chunks`` is a blocking iterable the
+        producer fills as the rollout decodes, so segment 0 ships while later
+        frames do not exist yet. That is the pipelining this whole path was built
+        for, and the reason the batch version chunks its input at all.
+
+        ``expected`` is therefore genuinely unknown, not merely unstated. Progress
+        is a monotonic count capped below 100 rather than a fraction, because
+        there is no denominator to divide by -- see :meth:`_cmaf_progress`.
+        """
+        created = int(time.time())
+        segment_seconds = cmaf_segment_seconds()
+        cadence = cmaf_emit_cadence_s()
+
+        pieces = _AsyncFragments(
+            stream_frames_to_cmaf(frame_chunks, fps, segment_seconds)
+        )
+        emitted = 0
+        try:
+            async for kind, payload, extra in pieces:
+                if kind == "init":
+                    yield self._cmaf_chunk(
+                        request_id,
+                        created,
+                        CMAF_METADATA_TAG,
+                        metadata_bytes(None, segment_seconds, extra),
+                        progress=0,
+                    )
+                    yield self._cmaf_chunk(
+                        request_id, created, CMAF_INIT_TAG, payload, progress=1
+                    )
+                    continue
+                if cadence > 0:
+                    await asyncio.sleep(cadence)
+                emitted += 1
+                yield self._cmaf_chunk(
+                    request_id,
+                    created,
+                    f"{CMAF_SEGMENT_PREFIX}{extra}",
+                    payload,
+                    self._live_progress(emitted),
+                )
+        except Exception as e:
+            # init and some segments may already be with the client, so it holds a
+            # partial but valid asset. Saying so beats stopping silently, which is
+            # indistinguishable from a clip that simply ended.
+            logger.error(
+                "Live CMAF streaming failed for request %s after %d segment(s): %s",
+                request_id,
+                emitted,
+                e,
+            )
+            yield self._cmaf_failure(request_id, created, str(e))
+            return
+        finally:
+            await pieces.aclose()
+
+        logger.info(
+            "Live CMAF stream for %s complete: %d segment(s)", request_id, emitted
+        )
+
+    @staticmethod
+    def _live_progress(emitted: int) -> int:
+        """Progress for a stream whose length is not knowable.
+
+        Monotonic and asymptotic rather than a percentage: there is no total to be
+        a fraction of. It approaches but never reaches 100, so a client can show
+        motion without ever being told the stream finished before it did.
+        """
+        return max(1, min(99, 100 - int(90 / (1 + emitted * 0.15))))
+
+    @staticmethod
+    def _expected_segments(num_frames: int, fps: int, segment_seconds: int) -> int:
+        """Best-effort segment count, used only to shape the progress number."""
+        per_segment = max(1, fps * max(1, segment_seconds))
+        return max(1, -(-num_frames // per_segment))
+
+    @staticmethod
+    def _cmaf_progress(emitted: int, expected: int) -> int:
+        """Progress for an open-ended stream.
+
+        An estimate, deliberately capped below 100: hardware encoders do not
+        always honor the requested GOP, so the real segment count can exceed the
+        prediction, and a progress field that reached 100 mid-stream would be
+        worse than one that merely lags.
+        """
+        return max(1, min(99, int((emitted / max(1, expected)) * 100)))
+
+    @staticmethod
+    def _frame_chunks(canonical: np.ndarray, fps: int, segment_seconds: int):
+        """Feed the encoder one segment's worth of frames at a time.
+
+        Chunking matters even though the frames are all in hand: writing the
+        whole array in one ``write()`` would fill the pipe buffer and block until
+        the encoder drained it, which serializes the very overlap this exists
+        for. It also mirrors the shape a live rollout will deliver.
+        """
+        step = max(1, fps * max(1, segment_seconds))
+        for start in range(0, len(canonical), step):
+            yield canonical[start : start + step]
 
     async def _encode_image(
         self,
@@ -614,4 +876,34 @@ class OutputFormatter:
         """Delegate binary-CMAF streaming to the diffusion (image/video) formatter."""
         return self._formatters["image"].stream_video_cmaf(
             stage_output, request_id, fps=fps
+        )
+
+    def stream_video_cmaf_persistent(
+        self, stage_output: Any, request_id: str, *, fps: int
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Delegate persistent-ffmpeg binary-CMAF streaming to the diffusion formatter."""
+        return self._formatters["image"].stream_video_cmaf_persistent(
+            stage_output, request_id, fps=fps
+        )
+
+    def stream_video_cmaf_live(
+        self, frame_chunks: Any, request_id: str, *, fps: int
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Delegate live binary-CMAF streaming to the diffusion formatter."""
+        return self._formatters["image"].stream_video_cmaf_live(
+            frame_chunks, request_id, fps=fps
+        )
+
+    async def format_video_frames(
+        self, frames: Any, request_id: str, *, fps: int
+    ) -> Dict[str, Any] | None:
+        """Format already-canonical frames as a single video response.
+
+        :meth:`format` cannot serve this: it dispatches on the engine output's
+        ``final_output_type``, and a pipelined stream never has an engine output --
+        the router assembles its own frames from per-block decodes. This addresses
+        the video formatter directly instead of inventing a fake wrapper object.
+        """
+        return await self._formatters["image"].format(
+            frames, request_id, request_type=RequestType.VIDEO_GENERATION, fps=fps
         )

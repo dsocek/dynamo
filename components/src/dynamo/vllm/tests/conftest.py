@@ -75,6 +75,23 @@ def pytest_ignore_collect(collection_path, config):
     return None
 
 
+def as_transport_returns(value):
+    """Wrap a worker return value the way vllm-omni's control-plane RPC does.
+
+    Lives here so the Causal-Forcing fakes in different test modules cannot disagree
+    about the shape. A fake that wrapped only one of the two levels is why a nesting
+    bug reached hardware: ``drain()`` handed back a list-of-blocks where one block was
+    expected, and the first sign of it was a tensor method being called on a list, deep
+    inside the VAE, with nothing left in the traceback pointing at the transport.
+
+    * ``MultiprocDiffusionExecutor`` -- only rank 0 has a result_mq, so it collects
+      exactly one response, and with ``unique_reply_rank`` unset (nothing on the async
+      control-plane path sets it) it returns the response *list*, not ``responses[0]``.
+    * the orchestrator -- appends one result per live replica.
+    """
+    return [[value]]
+
+
 def make_cli_args_fixture(module_name: str):
     """Create a pytest fixture for mocking CLI arguments for vllm backend."""
 

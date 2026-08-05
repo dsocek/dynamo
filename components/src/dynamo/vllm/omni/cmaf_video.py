@@ -28,12 +28,12 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Optional
 
 import numpy as np
 
 from dynamo.common.utils.video_utils import (
     encode_video,
+    encode_video_fragments,
     h264_codec_string_from_init,
     split_fragmented_mp4,
 )
@@ -47,6 +47,12 @@ CMAF_PROTOCOL = "dynamo-video-binary-cmaf-v1"
 CMAF_METADATA_TAG = "cmaf:metadata"
 CMAF_INIT_TAG = "cmaf:init"
 CMAF_SEGMENT_PREFIX = "cmaf:segment:"
+
+# ``segment_count`` value advertised when the total is not yet known because
+# segments are still being produced. 0 is used rather than null so the field
+# stays a number for clients that predate open-ended streams; they will simply
+# append nothing, which is safe. New clients branch on ``open_ended``.
+CMAF_OPEN_ENDED = 0
 
 # Fallback H.264 codec string (Main profile, level 3.1) advertised only when the
 # real profile/level cannot be parsed from the encoded init segment.
@@ -129,12 +135,16 @@ def source_buffer_mime_type(video_codec: str) -> str:
 
 
 def metadata_bytes(
-    segment_count: Optional[int], target_duration_seconds: int, video_codec: str
+    segment_count: int | None, target_duration_seconds: int, video_codec: str
 ) -> bytes:
     """Serialize the ``cmaf:metadata`` payload (JSON, UTF-8).
 
-    ``segment_count`` is ``None`` on the live streaming path (the total is not
-    known ahead of time); the client keys end-of-stream off the DONE frame.
+    ``segment_count`` may be ``None``, meaning *open-ended*: the segments are
+    being produced as the video is generated, so how many there will be is not
+    yet known. A client must then read until the stream ends rather than loop to
+    a count -- see :data:`CMAF_OPEN_ENDED`. Both live paths pass ``None``: the
+    persistent-ffmpeg encoder and the fragment generator alike learn the total
+    only when the stream ends.
     """
     payload = {
         "protocol": CMAF_PROTOCOL,
@@ -144,7 +154,11 @@ def metadata_bytes(
         "audio_codec": None,
         "has_audio": False,
         "target_duration_seconds": target_duration_seconds,
-        "segment_count": segment_count,
+        # Kept for clients written against the fixed-count metadata. 0 rather
+        # than null because the field is typed as a number there; a client that
+        # understands open-ended streams should branch on `open_ended`.
+        "segment_count": CMAF_OPEN_ENDED if segment_count is None else segment_count,
+        "open_ended": segment_count is None,
     }
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
@@ -199,3 +213,57 @@ def package_frames_to_cmaf(
         video_codec,
     )
     return init_bytes, segments, target_duration, video_codec
+
+
+def stream_frames_to_cmaf(
+    frame_chunks,
+    fps: int,
+    segment_seconds: int,
+    *,
+    width: int | None = None,
+    height: int | None = None,
+):
+    """Incremental :func:`package_frames_to_cmaf`: yield CMAF pieces as they encode.
+
+    Same protocol, different latency profile. :func:`package_frames_to_cmaf`
+    cannot emit anything until the whole clip is encoded, because
+    :func:`encode_video` muxes to a temp file. This drives
+    :func:`encode_video_fragments` instead, which muxes to a pipe, so a media
+    segment leaves for the client as soon as the encoder closes it.
+
+    The codec string is parsed from the init segment, which arrives before any
+    media -- so the metadata frame can still advertise the true profile/level
+    rather than a guess, exactly as the batch path does.
+
+    Args:
+        frame_chunks: Iterable of canonical ``(T, H, W, 3) uint8`` RGB arrays.
+            Chunk boundaries are independent of segment boundaries.
+        fps: Frames per second of the generated clip.
+        segment_seconds: Target duration of each media fragment.
+        width / height: Passed through to the encoder; inferred when omitted.
+
+    Yields:
+        ``("init", bytes, codec_string)`` once, then ``("segment", bytes, index)``
+        per fragment. The caller owns the tag/metadata framing.
+
+    Raises:
+        RuntimeError: If encoding fails or produces no init segment.
+    """
+    index = 0
+    for kind, payload in encode_video_fragments(
+        frame_chunks,
+        fps,
+        codec="h264",
+        gop_seconds=segment_seconds,
+        width=width,
+        height=height,
+    ):
+        if kind == "init":
+            codec = h264_codec_string_from_init(payload) or CMAF_FALLBACK_VIDEO_CODEC
+            logger.info(
+                "CMAF stream opened: init (%d bytes), codec=%s", len(payload), codec
+            )
+            yield ("init", payload, codec)
+        else:
+            yield ("segment", payload, index)
+            index += 1

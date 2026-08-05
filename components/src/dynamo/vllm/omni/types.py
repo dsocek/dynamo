@@ -61,6 +61,9 @@ class StageOutput(BaseModel):
                 # travel via the connector under {request_id}_c{n}).
                 "chunk_index",
                 "is_last",
+                "cf_session",
+                "cf_block",
+                "cf_last",
             }
             dropped = set(values.keys()) - known
             if dropped:
@@ -85,12 +88,34 @@ class StageOutput(BaseModel):
     sampling_params_list: dict | None = None
     finished: bool | None = None
     error: str | None = None
-    # Per-chunk block-stream control signals (work-item b, §8). Present only on
-    # a streamed stage's yields: chunk_index is the 0-based block index, is_last
-    # marks the terminal signal. The router (work-item c) uses these to dispatch
-    # a per-chunk downstream decode; they are not forwarded to the next stage.
+    # Two independent streaming lanes share this envelope, and they are gated by
+    # different fields on purpose -- see cf_streaming_stage() and the n_streamed
+    # branch in OmniStageWorker.generate.
+    #
+    # Lane A, "single-shot streamed" (chunk_index/is_last): one ordinary request
+    # whose stage streams its blocks out as they are produced. The stage itself
+    # decides -- the engine emits non-terminal chunks because the YAML set
+    # stream_dit_blocks -- so no client opt-in exists and no session outlives the
+    # request. chunk_index is the 0-based block index, is_last marks the terminal
+    # signal.
     chunk_index: int | None = None
     is_last: bool | None = None
+    # Lane B, "session pipelined" (cf_session/cf_block/cf_last): many requests
+    # against one long-lived stream, so every chunk has to reach the *same* VAE
+    # worker -- the decoder's temporal feat_cache is what makes chunk boundaries
+    # seam-free, and it lives in one process. cf_session names that stream so the
+    # next stage can address its decode cursor; cf_block is the block ordinal,
+    # which the next stage needs because decode order is the stream's order, not
+    # arrival order.
+    cf_session: str | None = None
+    cf_block: int | None = None
+    # Marks the last block of the stream. Needed because a pipelined stage emits
+    # many chunks and ``finished`` is per-chunk: without this the consumer could
+    # not tell "this block is done" from "the stream is done", and for video the
+    # two are indistinguishable downstream -- both look like a shorter clip.
+    # (Lane A's is_last is the same idea; the two lanes keep separate fields so
+    # a consumer can never mistake one lane's terminal for the other's.)
+    cf_last: bool | None = None
 
     def to_next_stage_request(self, request_id: str) -> dict:
         """Build the request dict for the next stage: only inter-stage protocol fields.
@@ -98,7 +123,14 @@ class StageOutput(BaseModel):
         shm_meta is intentionally excluded — it is final-stage → router only.
         """
         fields = self.model_dump(
-            include={"original_prompt", "stage_connector_refs", "sampling_params_list"},
+            include={
+                "original_prompt",
+                "stage_connector_refs",
+                "sampling_params_list",
+                "cf_session",
+                "cf_block",
+                "cf_last",
+            },
             exclude_none=True,
         )
         fields["request_id"] = request_id
@@ -123,6 +155,12 @@ class StageRequest(BaseModel):
     # StageOutput.stage_connector_refs). Callers normalize string keys to int via _int_keyed().
     stage_connector_refs: dict[str, Any] | None = None
     sampling_params_list: dict | None = None
+    # Causal-Forcing streaming: see StageOutput.cf_session. Present only on the
+    # per-block requests a pipelined rollout produces; absent on one-shot
+    # requests, which is what keeps the batch path byte-identical.
+    cf_session: str | None = None
+    cf_block: int | None = None
+    cf_last: bool | None = None
 
 
 def _int_keyed(d: dict | None) -> dict[int, Any]:

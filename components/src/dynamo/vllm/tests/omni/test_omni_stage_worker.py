@@ -519,6 +519,68 @@ stages:
     assert stage_1["input_connectors"]["from_stage_0"] == ("connector_of_shared_memory")
 
 
+def test_ensure_stage_connectors_adds_the_final_stage_router_edge(tmp_path):
+    """A pipelined stream needs this edge and cannot fall back to SHM-by-request-id:
+    it emits many blocks under one request id, and SharedMemoryConnector names the
+    segment and its lockfile after the key, so the blocks would overwrite each other.
+    The key is "to_stage_router" because the loader strips the "to_stage_" prefix to
+    name the far end, giving the ("1", "router") edge the worker looks up."""
+    config_path = tmp_path / "cf_disagg.yaml"
+    config_path.write_text(
+        """
+stages:
+  - stage_id: 0
+  - stage_id: 1
+""".lstrip()
+    )
+    stage_configs = [
+        SimpleNamespace(stage_id=0, engine_input_source=[]),
+        SimpleNamespace(stage_id=1, engine_input_source=[0]),
+    ]
+
+    resolved_path = _ensure_stage_connectors(str(config_path), stage_configs)
+
+    with open(resolved_path) as f:
+        resolved = yaml.safe_load(f)
+    stages = {stage["stage_id"]: stage for stage in resolved["stages"]}
+    assert (
+        stages[1]["output_connectors"]["to_stage_router"]
+        == "connector_of_shared_memory"
+    )
+    # Only the last stage talks to the router; stage 0's output goes to stage 1.
+    assert "output_connectors" not in stages[0]
+
+
+def test_ensure_stage_connectors_keeps_an_explicit_router_connector(tmp_path):
+    """An explicitly configured router edge is a deployment decision -- a multi-node
+    deployment needs a non-SHM connector there, and silently overwriting it with SHM
+    would fail only once the router and the final stage landed on different hosts."""
+    config_path = tmp_path / "cf_disagg.yaml"
+    config_path.write_text(
+        """
+connectors:
+  my_nixl:
+    name: NixlConnector
+stages:
+  - stage_id: 0
+  - stage_id: 1
+    output_connectors:
+      to_stage_router: my_nixl
+""".lstrip()
+    )
+    stage_configs = [
+        SimpleNamespace(stage_id=0, engine_input_source=[]),
+        SimpleNamespace(stage_id=1, engine_input_source=[0]),
+    ]
+
+    resolved_path = _ensure_stage_connectors(str(config_path), stage_configs)
+
+    with open(resolved_path) as f:
+        resolved = yaml.safe_load(f)
+    stage_1 = next(stage for stage in resolved["stages"] if stage["stage_id"] == 1)
+    assert stage_1["output_connectors"]["to_stage_router"] == "my_nixl"
+
+
 def test_ensure_stage_connectors_rejects_non_mapping_connectors(tmp_path):
     config_path = tmp_path / "glm_image.yaml"
     config_path.write_text(

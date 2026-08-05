@@ -12,6 +12,7 @@ import os
 import shutil
 import tempfile
 from dataclasses import dataclass
+from collections.abc import Mapping
 from typing import Any, AsyncGenerator
 
 import torch
@@ -23,14 +24,23 @@ from vllm_omni.entrypoints.stage_utils import serialize_obj, shm_write_bytes
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 from dynamo import prometheus_names
+from dynamo.common.utils.video_utils import parse_size
 from dynamo.llm import ModelType
 from dynamo.runtime import DistributedRuntime
 from dynamo.vllm.health_check import VllmOmniHealthCheckPayload
 from dynamo.vllm.main import setup_metrics_collection
 from dynamo.vllm.omni.args import OmniConfig
+from dynamo.vllm.omni.cf_dispatch import CFDispatchError, CFSessionDispatcher
+from dynamo.vllm.omni.cf_pipeline import cf_put_key
+from dynamo.vllm.omni.cf_session import (
+    CFSessionRequestError,
+    has_cf_session,
+    parse_cf_session,
+)
 from dynamo.vllm.omni.connectors import register_dynamoomni_nixl_connector
 from dynamo.vllm.omni.types import StageEngine, StageRequest, _int_keyed
 from dynamo.vllm.omni.utils import (
+    DEFAULT_VIDEO_SIZE,
     _build_sampling_params,
     ensure_awaited,
     is_empty_payload,
@@ -93,6 +103,17 @@ class OmniStageWorker:
     async def generate(self, request: dict, context) -> AsyncGenerator[dict, None]:
         req = StageRequest.model_validate(request)
         request_id = req.request_id or context.id()
+
+        # Causal-Forcing pipelined streaming: one chunk per rollout block instead
+        # of one per request. Branches early and stays entirely out of the batch
+        # path below, which is deliberate -- the one-shot chain is the tested
+        # thing and a session request is recognizable up front, so there is no
+        # reason for the two to share a code path they would both have to guard.
+        if cf_streaming_stage(req, request) is not None:
+            async for chunk in self._generate_cf_stream(req, request, request_id):
+                yield chunk
+            return
+
         original_prompt = req.original_prompt
         # JSON sends dict keys as strings; normalize to int for stage_connector_refs.
         stage_connector_refs = _int_keyed(req.stage_connector_refs)
@@ -186,7 +207,14 @@ class OmniStageWorker:
             async for chunk in self.engine.generate(
                 prompt, request_id=request_id, sampling_params_list=sp
             ):
-                if not bool(getattr(chunk, "finished", False)):
+                # ``finished`` defaults True, matching DiffusionOutput: an output
+                # that does not carry the field is a whole result, not a stream
+                # block. Defaulting False instead would route every engine output
+                # without the attribute -- LLM RequestOutputs, plain dicts -- down
+                # the per-chunk lane, so the terminal aggregated result would never
+                # be emitted and the request would hang waiting for a chunk that
+                # never comes.
+                if not bool(_chunk_finished(chunk)):
                     if connector is not None:
                         # Inter-stage lane (work-item b): DiT streams latent
                         # blocks to the next stage under per-chunk connector keys.
@@ -404,6 +432,245 @@ class OmniStageWorker:
         return shm_write_bytes(
             serialize_obj(chunk), name=_chunk_key(request_id, chunk_index)
         )
+    # -- Causal-Forcing pipelined streaming ---------------------------------
+
+    async def _generate_cf_stream(
+        self, req: StageRequest, request: dict, request_id: str
+    ) -> AsyncGenerator[dict, None]:
+        """Serve one Causal-Forcing session request, one chunk per block.
+
+        Which half of the stream this is depends on where the session id came
+        from, and that is not a preference -- it is the only signal available.
+        Stage 0 reads it off the request's ``nvext`` annotations, because that is
+        the one channel a client can extend end to end. Stage N>0 reads the
+        ``cf_session`` field the previous stage put on the hop, because ``nvext``
+        never reaches it.
+        """
+        stage = cf_streaming_stage(req, request)
+        if stage is None:  # pragma: no cover -- generate() already checked
+            raise RuntimeError("_generate_cf_stream called for a non-session request")
+
+        if stage == "dit":
+            gen = self._cf_stream_rollout(request, request_id)
+        else:
+            gen = self._cf_stream_decode(req, request_id)
+
+        try:
+            async for chunk in gen:
+                yield chunk
+        except CFDispatchError as e:
+            # A routing or delivery failure: the session is not where we thought,
+            # or the worker never ran the call. Not the client's fault, and not
+            # something a retry of this request would fix.
+            logger.error("Stage %d: CF session dispatch failed: %s", self.stage_id, e)
+            yield {"error": str(e), "finished": True, "cf_last": True}
+        except CFSessionRequestError as e:
+            logger.warning(
+                "Stage %d: malformed CF session request: %s", self.stage_id, e
+            )
+            yield {"error": str(e), "finished": True, "cf_last": True}
+        except Exception as e:
+            logger.error(
+                "Stage %d: CF stream failed for %s: %s",
+                self.stage_id,
+                request_id,
+                e,
+                exc_info=True,
+            )
+            yield {"error": str(e), "finished": True, "cf_last": True}
+
+    async def _cf_stream_rollout(
+        self, request: dict, request_id: str
+    ) -> AsyncGenerator[dict, None]:
+        """Stage 0: roll the session out a block at a time, putting each downstream.
+
+        ``max_blocks=1`` is what makes this a pipeline rather than a batch with
+        extra steps. Draining everything queued would produce the same tensors and
+        hand them over all at once, leaving the VAE stage idle for the whole
+        rollout and then the DiT stage idle for the whole decode. One block per
+        RPC costs a host round-trip each (~585 KB pickled at 480x832, against
+        ~0.96 s of compute) and buys the overlap.
+        """
+        cf_req = parse_cf_session(request.get("nvext"))
+        if cf_req is None:  # pragma: no cover -- the caller established this
+            raise RuntimeError("no cf_session annotation on a session request")
+
+        prompt = (request.get("prompt") or "").strip()
+        if not prompt:
+            raise CFSessionRequestError("a session scene needs a non-empty prompt.")
+
+        dispatcher = CFSessionDispatcher(self.engine, self.stage_id)
+        opened = await dispatcher.ensure_open(
+            cf_req.session_id,
+            continues=cf_req.scene.transition == "continue",
+            **_cf_open_kwargs(request),
+        )
+        logger.info(
+            "[CF_STREAM] stage %d session %s: %s, scene=%s",
+            self.stage_id,
+            cf_req.session_id,
+            "opened" if opened else "already open",
+            cf_req.scene.transition,
+        )
+        await dispatcher.push(cf_req.session_id, prompt, **cf_req.scene.push_kwargs())
+
+        block = 0
+        try:
+            while True:
+                blocks = await dispatcher.drain(cf_req.session_id, max_blocks=1)
+                if not blocks:
+                    # The queue is dry, which ends *this request's* rollout, not
+                    # the session: the KV window stays live so the next scene can
+                    # continue the shot.
+                    break
+                latents = blocks[0]
+                metadata = await self._cf_put_block(latents, request_id, block)
+                yield {
+                    "original_prompt": {"prompt": prompt},
+                    "stage_connector_refs": {str(self.stage_id): metadata},
+                    "cf_session": cf_req.session_id,
+                    "cf_block": block,
+                    "finished": True,
+                }
+                block += 1
+        finally:
+            if cf_req.close:
+                # Honoured even on failure: a session that outlives its request
+                # holds a KV window, and because the VAE's temporal cache is
+                # per-module rather than per-session it blocks the whole card
+                # until the idle timeout reclaims it.
+                await dispatcher.close(cf_req.session_id, missing_ok=True)
+
+        logger.info(
+            "[CF_STREAM] stage %d session %s emitted %d block(s)",
+            self.stage_id,
+            cf_req.session_id,
+            block,
+        )
+        # A terminal marker of its own rather than a flag on the last block: the
+        # block count is not known until the rollout runs dry, so there is no
+        # earlier chunk that could have carried it.
+        yield {
+            "cf_session": cf_req.session_id,
+            "cf_block": block,
+            "cf_last": True,
+            "finished": True,
+        }
+
+    async def _cf_stream_decode(
+        self, req: StageRequest, request_id: str
+    ) -> AsyncGenerator[dict, None]:
+        """Stage 1: decode one block through the session's live temporal cache.
+
+        One request per block, so this is a single decode and a single put -- the
+        pipelining is the router's, not this method's. What makes it a *session*
+        call rather than an ordinary stage run is ``session_decode_step``: it
+        keeps the decoder's ``feat_cache`` alive between calls, so this block's
+        first frame attends to the context the previous block left behind. Decode
+        each block through the batch path instead and every block boundary would
+        be a visible seam.
+        """
+        session_id = req.cf_session
+        block = req.cf_block or 0
+        dispatcher = CFSessionDispatcher(self.engine, self.stage_id)
+
+        if req.cf_last:
+            # The rollout's terminal marker. Nothing to decode; release the
+            # decode cursor so the next stream starts from a clean feat_cache.
+            await dispatcher.close(session_id, missing_ok=True)
+            yield {
+                "cf_session": session_id,
+                "cf_block": block,
+                "cf_last": True,
+                "finished": True,
+            }
+            return
+
+        # A decode cursor is cheap to open and has no history to lose, so unlike a
+        # rollout it may be opened on any block -- which is what lets the VAE
+        # stage recover from having been restarted mid-stream.
+        await dispatcher.ensure_open(session_id)
+
+        latents = await self._cf_get_block(req, request_id, block)
+        frames = await dispatcher.decode_step(session_id, latents)
+
+        metadata = await self._cf_put_block(frames, request_id, block, to_router=True)
+        yield {
+            "stage_connector_refs": {str(self.stage_id): metadata},
+            "cf_session": session_id,
+            "cf_block": block,
+            "finished": True,
+        }
+
+    async def _cf_put_block(
+        self, payload: Any, request_id: str, block: int, *, to_router: bool = False
+    ) -> Any:
+        """Hand one block to the next hop, keyed per block.
+
+        The per-block key is not cosmetic: ``SharedMemoryConnector`` names both
+        the segment and its lockfile after the key, so every block of a stream
+        under one request id would overwrite its predecessor while contending on
+        a single lock.
+        """
+        to_stage: int | str = "router" if to_router else self.stage_id + 1
+        connector = self.connectors.get(_connector_key(self.stage_id, to_stage))
+        if connector is None:
+            raise CFDispatchError(
+                f"Stage {self.stage_id}: no connector for edge "
+                f"({self.stage_id}→{to_stage}); a pipelined stream cannot fall back "
+                "to SHM-by-request-id, because every block would reuse one key."
+            )
+        ok, _, metadata = await ensure_awaited(
+            connector.put(
+                str(self.stage_id),
+                str(to_stage),
+                cf_put_key(request_id, block),
+                payload,
+            )
+        )
+        if not ok:
+            raise CFDispatchError(
+                f"Stage {self.stage_id}: connector.put() failed for block {block}"
+            )
+        return metadata
+
+    async def _cf_get_block(
+        self, req: StageRequest, request_id: str, block: int
+    ) -> Any:
+        """Fetch one block's latents from the upstream stage's connector."""
+        refs = _int_keyed(req.stage_connector_refs)
+        from_stage = (
+            self._engine_input_source[0]
+            if self._engine_input_source
+            else min(refs, default=None)
+        )
+        if from_stage is None or from_stage not in refs:
+            raise CFDispatchError(
+                f"Stage {self.stage_id}: block {block} carries no connector ref "
+                f"(refs={sorted(refs)})"
+            )
+        connector = self.connectors.get(_connector_key(from_stage, self.stage_id))
+        if connector is None:
+            raise CFDispatchError(
+                f"Stage {self.stage_id}: no connector for edge "
+                f"({from_stage}→{self.stage_id})"
+            )
+        payload = unwrap_connector_payload(
+            await ensure_awaited(
+                connector.get(
+                    str(from_stage),
+                    str(self.stage_id),
+                    cf_put_key(request_id, block),
+                    metadata=refs[from_stage],
+                )
+            )
+        )
+        if is_empty_payload(payload):
+            raise CFDispatchError(
+                f"Stage {self.stage_id}: empty payload for block {block} "
+                f"from stage {from_stage}"
+            )
+        return payload
 
     def _build_engine_core_request_from_upstream(
         self,
@@ -783,6 +1050,66 @@ def _chunk_key(request_id: str, chunk_index: int) -> str:
     return f"{request_id}_c{chunk_index}"
 
 
+def _chunk_finished(chunk: Any) -> bool:
+    """Whether an engine output is a whole result rather than a stream block.
+
+    Defaults to True for anything that does not report the field at all, which
+    is the only safe default: ``DiffusionOutput.finished`` is itself ``True`` by
+    default, and every non-diffusion engine output (an LLM ``RequestOutput``, a
+    plain dict from a test double or a direct-API caller) is a complete result.
+    Treating those as non-terminal would send them down the per-chunk lane and
+    the request would then never see its terminal chunk.
+
+    Attribute first, then mapping key, because the two engine paths disagree on
+    shape and neither is wrong: diffusion yields dataclass-like outputs, while
+    some callers hand back dicts.
+    """
+    if hasattr(chunk, "finished"):
+        return bool(chunk.finished)
+    if isinstance(chunk, Mapping):
+        return bool(chunk.get("finished", True))
+    return True
+
+
+def cf_streaming_stage(req: StageRequest, request: dict) -> str | None:
+    """Which half of a Causal-Forcing stream this request is, or None if it is not one.
+
+    Two different signals, because a session id reaches the two stages by
+    different routes and neither is available at both. Stage 0 gets it from
+    ``nvext.annotations``, the only channel a client can extend without a Rust
+    change. Stage N>0 gets it from the ``cf_session`` field the previous stage set
+    on the hop, because ``nvext`` is not forwarded past stage 0.
+
+    Returns ``"dit"`` for the rollout half, ``"vae"`` for the decode half. Total
+    and cheap: an ordinary one-shot request carries neither signal and returns
+    None, which is what keeps the batch path untouched.
+    """
+    if req.cf_session:
+        return "vae"
+    if has_cf_session(request.get("nvext")):
+        return "dit"
+    return None
+
+
+def _cf_open_kwargs(request: dict) -> dict[str, Any]:
+    """Geometry and seed for ``session_open``, read off the frontend request.
+
+    Only what the *session* owns, which is what outlives one scene: the KV window
+    is sized by height/width, and the stream seed is the base every scene's own
+    seed derives from. Per-scene parameters travel on the scene instead.
+    """
+    nvext = request.get("nvext")
+    nvext = nvext if isinstance(nvext, dict) else {}
+    width, height = parse_size(request.get("size") or DEFAULT_VIDEO_SIZE)
+    kwargs: dict[str, Any] = {
+        "height": int(nvext.get("height") or height),
+        "width": int(nvext.get("width") or width),
+    }
+    if nvext.get("seed") is not None:
+        kwargs["seed"] = int(nvext["seed"])
+    return kwargs
+
+
 def _uses_nixl_connector(stage_configs_path: str, stage_configs: list[Any]) -> bool:
     """Check if any stage connector uses NixlConnector."""
     try:
@@ -837,7 +1164,21 @@ def _load_processor(func_path: str | None) -> Any:
 
 
 def _ensure_stage_connectors(stage_configs_path: str, stage_configs: list[Any]) -> str:
-    """Add default SHM connector edges for stage configs that omit them."""
+    """Add default SHM connector edges for stage configs that omit them.
+
+    Two kinds of edge are synthesized: the inter-stage ``from_stage_N`` inputs implied
+    by each stage's ``engine_input_source``, and the final stage's output edge to the
+    router.
+
+    The router edge exists for the pipelined Causal-Forcing path. A serial request may
+    fall back to ``shm_write_bytes(..., name=request_id)``, but a stream may not: it
+    emits many blocks under one request id, and ``SharedMemoryConnector`` names both
+    the segment and its lockfile after the key, so every block would overwrite its
+    predecessor while contending on a single lock. ``_cf_put_block`` therefore refuses
+    that fallback rather than corrupting the stream, which leaves this the place the
+    edge has to come from. Both the router and the stage worker call this function, so
+    the two ends stay in agreement about which edges exist.
+    """
     try:
         with open(stage_configs_path) as f:
             deploy_config = yaml.safe_load(f) or {}
@@ -877,6 +1218,19 @@ def _ensure_stage_connectors(stage_configs_path: str, stage_configs: list[Any]) 
             connector_key = f"from_stage_{int(from_stage)}"
             if connector_key not in input_connectors:
                 input_connectors[connector_key] = connector_name
+                changed = True
+
+    # The final stage's edge to the router. Keyed "to_stage_router" because
+    # initialize_connectors_from_config strips the "to_stage_" prefix to name the
+    # far end, giving the ("<final>", "router") key that _connector_key builds and
+    # both _cf_put_block and the router's own fetch look up.
+    final_stage_id = max(stages_by_id, default=None)
+    if final_stage_id is not None:
+        final_stage = stages_by_id[final_stage_id]
+        output_connectors = final_stage.setdefault("output_connectors", {})
+        if isinstance(output_connectors, dict):
+            if "to_stage_router" not in output_connectors:
+                output_connectors["to_stage_router"] = connector_name
                 changed = True
 
     if not changed:
