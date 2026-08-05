@@ -3,6 +3,7 @@
 
 """Stage router for disaggregated omni pipelines."""
 
+import asyncio
 import json
 import logging
 import time
@@ -12,6 +13,8 @@ from typing import Any, AsyncGenerator, Dict, List
 from vllm_omni.distributed.omni_connectors import initialize_orchestrator_connectors
 
 from dynamo import prometheus_names
+from dynamo.common.protocols.audio_protocol import NvAudioSpeechResponse
+from dynamo.common.protocols.video_protocol import NvVideosResponse
 from dynamo.common.storage import get_fs
 from dynamo.common.utils.output_modalities import (
     RequestType,
@@ -115,6 +118,78 @@ class OmniStageRouter:
         self.stage_clients[model_stage] = client
         logger.info("Registered stage client: %s", model_stage)
 
+    def _error_envelope(
+        self,
+        request_id: str,
+        message: str,
+        request_type: Any = None,
+    ) -> Dict[str, Any]:
+        """Build a client-visible error response in the shape the route expects.
+
+        A bare ``{"error": ..., "finished": True}`` dict is the *worker -> router*
+        error contract (``StageOutput``), not the *router -> frontend* one. The
+        frontend deserializes this yield into the modality's response type, and
+        for video that is ``NvVideosResponse``, whose ``id``/``model``/``created``
+        fields have no serde defaults. A bare dict therefore fails to deserialize
+        and the real message is replaced by ``missing field `id```, so every
+        distinct failure on this endpoint reports the same useless string. Emit
+        the full envelope instead: the Rust side already turns ``status ==
+        "failed"`` into a proper error (an ``0x04`` frame on the binary CMAF
+        route), so the message reaches the client verbatim.
+
+        ``finished`` is kept for the batch paths, where the router's own reply
+        loop still reads it; the response models ignore unknown keys.
+
+        ``request_type`` is compared by *value* rather than by identity: a caller
+        holding the enum and one holding the plain string must select the same
+        envelope, because picking the wrong modality here silently reintroduces
+        exactly the deserialization failure this method exists to prevent.
+        """
+        model_name = self.config.served_model_name or self.config.model
+        created = int(time.time())
+        rt = getattr(request_type, "value", request_type)
+        if rt == RequestType.VIDEO_GENERATION.value:
+            envelope = NvVideosResponse(
+                id=request_id,
+                object="video",
+                model=model_name,
+                status="failed",
+                progress=0,
+                created=created,
+                data=[],
+                error=message,
+            ).model_dump()
+        elif rt == RequestType.AUDIO_GENERATION.value:
+            envelope = NvAudioSpeechResponse(
+                id=request_id,
+                model=model_name,
+                status="failed",
+                created=created,
+                error=message,
+            ).model_dump()
+        else:
+            # Chat and image generation share the chat.completion.chunk error
+            # shape used by OutputFormatter._error_chunk and BaseHandler.
+            envelope = {
+                "id": request_id,
+                "created": created,
+                "object": "chat.completion.chunk",
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": f"Error: {message}",
+                        },
+                        "finish_reason": "error",
+                    }
+                ],
+                "error": message,
+            }
+        envelope["finished"] = True
+        return envelope
+
     async def generate(
         self,
         request: dict,
@@ -147,10 +222,9 @@ class OmniStageRouter:
             )
             client = self.stage_clients.get(model_stage)
             if client is None:
-                yield {
-                    "error": f"No client for stage '{model_stage}'",
-                    "finished": True,
-                }
+                yield self._error_envelope(
+                    request_id, f"No client for stage '{model_stage}'", request_type
+                )
                 return
 
             if stage_idx == 0:
@@ -182,7 +256,9 @@ class OmniStageRouter:
             stage_outputs.append(StageOutput.model_validate(raw_stage_output))
 
             if stage_outputs[-1].error:
-                yield {"error": stage_outputs[-1].error, "finished": True}
+                yield self._error_envelope(
+                    request_id, stage_outputs[-1].error, request_type
+                )
                 return
 
         final = stage_outputs[-1]
@@ -205,7 +281,11 @@ class OmniStageRouter:
             if chunk:
                 yield chunk
             else:
-                yield {"error": "Formatter returned no output for streamed clip", "finished": True}
+                yield self._error_envelope(
+                    request_id,
+                    "Formatter returned no output for streamed clip",
+                    request_type,
+                )
             return
         connectors = getattr(self, "connectors", {})
         # Accept either connector-based output (multi-node) or SHM (single-node legacy).
@@ -223,7 +303,7 @@ class OmniStageRouter:
                 if connectors
                 else "No SHM output from final stage"
             )
-            yield {"error": error_msg, "finished": True}
+            yield self._error_envelope(request_id, error_msg, request_type)
             return
 
         # Build formatting context from the original request
@@ -293,7 +373,11 @@ class OmniStageRouter:
         # Two stages exactly: DiT (0) then VAE (1). This live path is registered
         # only for the disaggregated causal-forcing video pipeline.
         if len(self.stage_configs) < 2:
-            yield {"error": "CMAF live streaming requires a 2-stage pipeline", "finished": True}
+            yield self._error_envelope(
+                request_id,
+                "CMAF live streaming requires a 2-stage pipeline",
+                request_type,
+            )
             return
 
         dit_cfg, vae_cfg = self.stage_configs[0], self.stage_configs[1]
@@ -302,36 +386,124 @@ class OmniStageRouter:
         dit_client = self.stage_clients.get(dit_stage)
         vae_client = self.stage_clients.get(vae_stage)
         if dit_client is None or vae_client is None:
-            yield {"error": "CMAF live streaming: missing DiT or VAE stage client", "finished": True}
+            yield self._error_envelope(
+                request_id,
+                "CMAF live streaming: missing DiT or VAE stage client",
+                request_type,
+            )
             return
 
-        # --- Stage 0 (DiT): drive to completion, collect the terminal ref. ---
-        # NOTE: the VAE is dispatched only AFTER the DiT rollout finishes (not
-        # after the first latent block): the VAE decode is temporally stateful
-        # (feat_cache), so all latent frames must pass through one persistent
-        # forward. The [cmaf-timing] logs make the DiT-done -> VAE-start handoff
-        # and time-to-first-frame explicit so a long startup can be attributed
-        # to the DiT rollout rather than a handoff stall.
+        # --- Stage 0 (DiT): drive in the background; do NOT wait for completion. ---
+        # [cmaf-step2] The VAE is dispatched as soon as the DiT's *first* latent
+        # block is on the connector, so pixel decode overlaps the remaining
+        # rollout. The VAE decode is temporally stateful (feat_cache), so all
+        # latent frames must still pass through ONE persistent forward — that
+        # invariant is preserved inside the VAE worker, which feeds blocks into a
+        # single decode session as they arrive (§4.2 Step 2), rather than by the
+        # router serializing the two stages. The [cmaf-timing] logs make the
+        # first-block -> VAE-start handoff and time-to-first-frame explicit.
         t0 = time.monotonic()
         logger.info("[cmaf-timing] router: DiT started for %s", request_id)
-        dit_raw: dict = {}
-        async for chunk in await dit_client.round_robin({"request_id": request_id, **request}):
-            data = chunk.data()
-            if isinstance(data, (str, bytes)):
-                data = json.loads(data)
-            dit_raw.update(data)
-        dit_output = StageOutput.model_validate(dit_raw)
-        if dit_output.error:
-            yield {"error": dit_output.error, "finished": True}
+
+        dit_error: dict = {}
+        dit_blocks_seen = 0
+        # Overlap timeline, all relative to t0. dit_ended_at stays None while the
+        # rollout is still running, which is itself the healthy signal.
+        dit_ended_at: float | None = None
+        first_pixel_at: float | None = None
+        first_ready: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        async def _drive_dit() -> None:
+            """Consume the DiT ready-signal stream to completion (no tensors here)."""
+            nonlocal dit_blocks_seen, dit_ended_at
+            try:
+                async for chunk in await dit_client.round_robin(
+                    {"request_id": request_id, **request}
+                ):
+                    data = chunk.data()
+                    if isinstance(data, (str, bytes)):
+                        data = json.loads(data)
+                    if data.get("error"):
+                        dit_error["error"] = data["error"]
+                        logger.error(
+                            "[cmaf-step2] router: DiT reported an error for %s after "
+                            "%d blocks at +%.2fs: %s",
+                            request_id, dit_blocks_seen, time.monotonic() - t0,
+                            data["error"],
+                        )
+                        break
+                    # The first ready signal carries the request facts the VAE
+                    # needs and means block c0 is on the connector.
+                    if data.get("chunk_index") is not None and not data.get("finished"):
+                        dit_blocks_seen += 1
+                    if not first_ready.done() and data.get("chunk_index") == 0:
+                        if data.get("original_prompt") is None:
+                            # The VAE would fall back to bare geometry defaults;
+                            # worth flagging since it points at a version skew
+                            # between router and DiT worker.
+                            logger.warning(
+                                "[cmaf-step2] router: DiT first ready signal for %s "
+                                "carries no original_prompt — is the DiT worker running "
+                                "the Step 2 code?",
+                                request_id,
+                            )
+                        first_ready.set_result(data)
+            except Exception as e:
+                logger.error(
+                    "Router: DiT stream failed for %s: %s", request_id, e, exc_info=True
+                )
+                dit_error["error"] = f"DiT stage failed: {e}"
+            finally:
+                dit_ended_at = time.monotonic() - t0
+                logger.info(
+                    "[cmaf-timing] router: DiT stream ended for %s at +%.2fs "
+                    "(%d latent blocks streamed)",
+                    request_id, dit_ended_at, dit_blocks_seen,
+                )
+                if not first_ready.done():
+                    # DiT produced no block: unblock the waiter with the reason.
+                    # Most likely the DiT ran in aggregated (non-streaming) mode, so
+                    # say that rather than just "no blocks".
+                    reason = dit_error.get("error") or (
+                        "DiT stage produced no latent blocks — it likely ran "
+                        "aggregated instead of block-streaming (check stream_dit_blocks)"
+                    )
+                    first_ready.set_exception(RuntimeError(reason))
+
+        dit_task = asyncio.ensure_future(_drive_dit())
+
+        try:
+            dit_first = await first_ready
+        except RuntimeError as e:
+            dit_task.cancel()
+            yield self._error_envelope(request_id, str(e), request_type)
             return
+        first_block_at = time.monotonic() - t0
         logger.info(
-            "[cmaf-timing] router: DiT done for %s in %.2fs; dispatching VAE",
-            request_id, time.monotonic() - t0,
+            "[cmaf-step2] router: DiT first block ready for %s at +%.2fs; "
+            "dispatching VAE concurrently (DiT %s)",
+            request_id,
+            first_block_at,
+            "already finished — expect SERIALIZED"
+            if dit_ended_at is not None
+            else "rollout still running",
         )
 
         # --- Stage 1 (VAE): consume the live pixel-chunk stream. ---
         fps = int((request.get("nvext") or {}).get("fps") or self.config.default_video_fps)
-        vae_request = dit_output.to_next_stage_request(request_id)
+        # [cmaf-step2] Synthesize the chunked upstream ref rather than taking it
+        # from the DiT terminal (which no longer exists at this point). No
+        # num_chunks — it is unknown while the rollout runs; the VAE terminates on
+        # the stream-end marker instead. Geometry comes from original_prompt, which
+        # the real VAE decode does not read anyway (it derives it from the latents).
+        vae_request = {
+            "request_id": request_id,
+            "stage_connector_refs": {str(dit_cfg.stage_id): {"chunked": True}},
+        }
+        if (op := dit_first.get("original_prompt")) is not None:
+            vae_request["original_prompt"] = op
+        if (spl := dit_first.get("sampling_params_list")) is not None:
+            vae_request["sampling_params_list"] = spl
         created = int(time.time())
         t_vae = time.monotonic()
         pixel_chunks_seen = 0
@@ -371,15 +543,37 @@ class OmniStageRouter:
                 seg_index += 1
 
         try:
+            vae_replies = 0
             async for chunk in await vae_client.round_robin(vae_request):
                 data = chunk.data()
                 if isinstance(data, (str, bytes)):
                     data = json.loads(data)
+                vae_replies += 1
+                # [cmaf-trace] Every VAE reply as the router sees it. The break
+                # below is driven purely by these two fields, so record them for
+                # each reply: it is the only way to tell "the VAE stopped sending"
+                # from "the router stopped listening".
+                logger.info(
+                    "[cmaf-trace] router: VAE reply #%d for %s — finished=%s "
+                    "has_shm_meta=%s chunk_index=%s error=%s",
+                    vae_replies - 1, request_id,
+                    data.get("finished"),
+                    data.get("shm_meta") is not None,
+                    data.get("chunk_index"),
+                    data.get("error"),
+                )
                 if data.get("error"):
-                    yield {"error": data["error"], "finished": True}
+                    yield self._error_envelope(
+                        request_id, data["error"], request_type
+                    )
                     return
                 # Terminal sentinel: no pixels — the tail is drained by finish().
                 if data.get("finished") and data.get("shm_meta") is None:
+                    logger.info(
+                        "[cmaf-trace] router: terminal sentinel for %s after %d "
+                        "pixel chunks (reply #%d) — leaving the VAE read loop",
+                        request_id, pixel_chunks_seen, vae_replies - 1,
+                    )
                     break
                 shm_meta = data.get("shm_meta")
                 if shm_meta is None:
@@ -390,6 +584,19 @@ class OmniStageRouter:
                     continue
                 canonical = to_canonical(images)
                 pixel_chunks_seen += 1
+                if first_pixel_at is None:
+                    first_pixel_at = time.monotonic() - t0
+                    # Time-to-first-frame is the headline number Step 2 moves, and
+                    # whether DiT was still running when it landed is the proof.
+                    logger.info(
+                        "[cmaf-step2] router: FIRST PIXEL CHUNK for %s at +%.2fs "
+                        "(DiT %s) — this is time-to-first-frame",
+                        request_id,
+                        first_pixel_at,
+                        "STILL RUNNING => overlapped"
+                        if dit_ended_at is None
+                        else f"already ended at +{dit_ended_at:.2f}s => serialized",
+                    )
                 logger.info(
                     "[cmaf-timing] router: VAE pixel chunk %d received for %s at +%.2fs (VAE start->here)",
                     pixel_chunks_seen - 1, request_id, time.monotonic() - t_vae,
@@ -406,14 +613,85 @@ class OmniStageRouter:
                 async for kind, payload in enc.finish():
                     async for item in _emit(kind, payload):
                         yield item
+            elif pixel_chunks_seen == 0:
+                # The VAE stream ended without a single pixel chunk, so nothing
+                # was ever yielded. Returning silently here leaves the request
+                # with no response at all, which the frontend reports only as an
+                # empty stream. Yield an explicit failed envelope so the real
+                # condition reaches the client.
+                logger.error(
+                    "[cmaf-trace] router: VAE produced ZERO pixel chunks for %s "
+                    "(%d replies, DiT %s) — emitting an explicit error instead of "
+                    "an empty stream",
+                    request_id, vae_replies,
+                    f"ended at +{dit_ended_at:.2f}s" if dit_ended_at is not None
+                    else "still running",
+                )
+                yield self._error_envelope(
+                    request_id,
+                    "CMAF live stream produced no pixel chunks: the VAE stage "
+                    f"sent {vae_replies} replies but no pixel data. The VAE "
+                    "terminated before decoding any frame — check the "
+                    "[cmaf-trace] lines in the VAE worker log.",
+                    request_type,
+                )
+                return
         except Exception as e:
             logger.error("Router: CMAF live stream failed for %s: %s", request_id, e, exc_info=True)
-            yield {"error": f"CMAF live stream failed: {e}", "finished": True}
+            yield self._error_envelope(
+                request_id, f"CMAF live stream failed: {e}", request_type
+            )
             return
+        finally:
+            # [cmaf-step2] The DiT drive runs concurrently, so reap it on every
+            # exit path — including an early return or a client disconnect that
+            # closes this generator — rather than leaving an orphan task behind.
+            if not dit_task.done():
+                dit_task.cancel()
+            try:
+                await dit_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        # A DiT failure after the first block still means a truncated video; the
+        # pixel stream just ends early, so surface it rather than ending cleanly.
+        if dit_error:
+            logger.error(
+                "Router: DiT stage reported an error for %s after streaming began: %s",
+                request_id, dit_error["error"],
+            )
+            yield self._error_envelope(request_id, dit_error["error"], request_type)
+            return
+        # The overlap verdict, stated outright: this is what the whole step is for,
+        # and reading it off interleaved timestamps by hand is error-prone. If the
+        # DiT stream ended before the first pixel chunk arrived, the stages ran
+        # serialized and Step 2 is not actually in effect.
+        overlapped = dit_ended_at is None or (
+            first_pixel_at is not None and first_pixel_at < dit_ended_at
+        )
+        logger.info(
+            "[cmaf-step2] router: live stream complete for %s — %d pixel chunks in "
+            "%.2fs; first block +%.2fs, first pixel %s, DiT end %s => %s",
+            request_id,
+            pixel_chunks_seen,
+            time.monotonic() - t0,
+            first_block_at,
+            f"+{first_pixel_at:.2f}s" if first_pixel_at is not None else "never",
+            f"+{dit_ended_at:.2f}s" if dit_ended_at is not None else "still running",
+            "OVERLAPPED (Step 2 working)"
+            if overlapped
+            else "SERIALIZED — decode did not overlap the rollout",
+        )
+        if not overlapped:
+            logger.warning(
+                "[cmaf-step2] router: stages ran serialized for %s. The VAE waited for "
+                "the full DiT rollout, so time-to-first-frame is unimproved. Likely "
+                "causes: something materialized the block stream (a list()/len() on it), "
+                "or the VAE fetched with a known num_chunks instead of polling.",
+                request_id,
+            )
         # Natural end: the Rust route emits the DONE(0x05) frame when this
-        # generator closes (§9). request_type is accepted for symmetry with the
-        # batch path; the CMAF wire contract is modality-fixed.
-        _ = request_type
+        # generator closes (§9). Success items are modality-fixed by the CMAF wire
+        # contract; request_type only shapes the error envelopes above.
 
     async def _format_output(
         self,
@@ -461,16 +739,25 @@ class OmniStageRouter:
                 )
             except Exception as e:
                 logger.error("Router: connector.get() failed for %s: %s", request_id, e)
-                yield {
-                    "error": f"Router connector.get() failed: {e}",
-                    "finished": True,
-                }
+                yield self._error_envelope(
+                    request_id, f"Router connector.get() failed: {e}", request_type
+                )
                 return
         else:
             # --- SHM fallback (single-node: router and final stage on same machine) ---
             shm_meta = stage_output.shm_meta
             if not shm_meta:
-                logger.warning("Router: no shm_meta in stage output")
+                # Unreachable via generate() (the caller already rejects a final
+                # stage with neither a connector ref nor SHM), but returning
+                # silently here would end the request with no response at all and
+                # the client would see only an empty stream. Say what happened.
+                logger.error("Router: no shm_meta in final stage output")
+                yield self._error_envelope(
+                    request_id,
+                    "No output from final stage: neither a router connector ref "
+                    "nor an SHM handle was returned",
+                    request_type,
+                )
                 return
             result = shm_deserialize(shm_meta)
 
@@ -495,10 +782,11 @@ class OmniStageRouter:
                 "Router: formatter returned None, final_output_type=%s",
                 final_output_type,
             )
-            yield {
-                "error": f"Formatter returned no output for type '{final_output_type}'",
-                "finished": True,
-            }
+            yield self._error_envelope(
+                request_id,
+                f"Formatter returned no output for type '{final_output_type}'",
+                request_type,
+            )
 
 
 def _reassemble_pixel_chunks(pixel_chunk_metas: list[dict]) -> Any:
