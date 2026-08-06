@@ -292,7 +292,20 @@ class DemoProxyHandler(http.server.BaseHTTPRequestHandler):
                 return
 
         try:
-            self._forward(self.path, body, head_only=head_only, token=token)
+            status = self._forward(self.path, body, head_only=head_only, token=token)
+            # A scene that FAILED must not keep holding the session's gate.
+            # release is False for session-scoped scenes (the gate is meant to
+            # span the whole storyboard), but that reasoning only holds while
+            # scenes are succeeding: the next scene is what would have released
+            # it, and after an error there may be no next scene. Holding on
+            # would pin the card until the idle timeout -- observed as repeated
+            # "429 busy with session <id>" minutes after a scene 404'd with a
+            # stale model id, with the GPUs sitting at 0% the whole time.
+            if status is not None and status >= 400:
+                sys.stderr.write(
+                    f"[demo-proxy] gate: upstream {status}, releasing session early\n"
+                )
+                release = True
         except (TimeoutError, OSError) as exc:
             # A dead upstream must not leave the caller's socket parked: that is
             # what pinned the gate on 2026-08-05. Release happens in `finally`.
@@ -308,7 +321,14 @@ class DemoProxyHandler(http.server.BaseHTTPRequestHandler):
         body: bytes | None,
         head_only: bool = False,
         token: str | None = None,
-    ) -> None:
+    ) -> int | None:
+        """Returns the upstream HTTP status, or None if it never answered.
+
+        The caller needs the status to decide whether to release the gate early,
+        so a failure that is a completed round-trip (4xx/5xx) stays
+        distinguishable from a healthy stream.
+        """
+        status: int | None = None
         upstream_headers = {
             key: value
             for key, value in self.headers.items()
@@ -326,6 +346,7 @@ class DemoProxyHandler(http.server.BaseHTTPRequestHandler):
         try:
             conn.request(self.command, path, body=body, headers=upstream_headers)
             response = conn.getresponse()
+            status = response.status
             self.send_response(response.status, response.reason)
             for key, value in response.getheaders():
                 if key.lower() in HOP_BY_HOP_HEADERS:
@@ -335,7 +356,7 @@ class DemoProxyHandler(http.server.BaseHTTPRequestHandler):
 
             if head_only:
                 response.read()
-                return
+                return status
 
             while True:
                 chunk = response.read(64 * 1024)
@@ -348,9 +369,14 @@ class DemoProxyHandler(http.server.BaseHTTPRequestHandler):
                     # tripping the stuck-owner timeout.
                     self.server.gpu_gate.heartbeat(token)
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            # The caller hung up mid-stream. Treat it as a failure so the gate is
+            # released now rather than waiting on the stuck-owner timeout: a
+            # browser that navigates away mid-storyboard sends no further scene,
+            # so nothing else would release it.
+            status = status if status is not None and status >= 400 else 499
         finally:
             conn.close()
+        return status
 
     def log_message(self, fmt: str, *args) -> None:
         sys.stderr.write(f"[demo-proxy] {self.address_string()} - {fmt % args}\n")

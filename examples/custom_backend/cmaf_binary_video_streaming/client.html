@@ -218,7 +218,9 @@
             <input id="baseUrl" type="text" />
           </div>
         </div>
-        <div class="controls three-up" style="margin-top: 14px">
+        <!-- Single-prompt only: a storyboard carries its own length per scene,
+             so these describe nothing in that mode and are hidden outright. -->
+        <div id="singleParams" class="controls three-up" style="margin-top: 14px">
           <div class="field">
             <label for="seconds">Duration (s)</label>
             <input
@@ -242,17 +244,22 @@
         <div class="controls" style="margin-top: 14px">
           <div class="field">
             <label for="model">Model</label>
-            <input id="model" type="text" value="/tmp/causal-forcing-1step" />
+            <!-- Filled in from /v1/models on load; the id is the launch path,
+                 which differs per host, so there is no useful static default. -->
+            <input id="model" type="text" placeholder="loading from /v1/models ..." />
           </div>
-          <div class="field">
+          <!-- Single-prompt only. Model stays visible in both modes (a
+               storyboard needs it too), so Prompt carries its own wrapper
+               rather than hiding the shared row. -->
+          <div class="field" id="promptField">
             <label for="prompt">Prompt</label>
             <input id="prompt" type="text" value="Dog running on a beach" />
           </div>
         </div>
 
         <div class="mode-tabs" style="margin-top: 18px">
-          <button id="modeSingle" type="button">Single prompt</button>
           <button id="modeStory" type="button">Storyboard (multi-scene)</button>
+          <button id="modeSingle" type="button">Single prompt</button>
         </div>
 
         <!-- Storyboard mode. A storyboard is NOT one request: the wire protocol
@@ -298,6 +305,30 @@
 
       <section class="panel">
         <video id="player" controls playsinline></video>
+        <!-- Background music is a separate <audio> element, deliberately NOT
+             muxed into the stream: the CMAF asset is video-only by construction
+             (cmaf_video.py reports has_audio=false and the SourceBuffer mime
+             carries a video codec only), so a real track would mean threading an
+             audio codec through the encoder, the metadata and a second
+             SourceBuffer. For a decorative bed, a looping element playing
+             alongside the video costs nothing and touches no pipeline code.
+             Swap in your own file with ?music=<name>.mp3 -- the proxy already
+             serves static files out of this directory (its _safe_static_path
+             keeps that confined to this directory). -->
+        <audio id="music" loop preload="auto"></audio>
+        <div class="actions" style="margin-top: 12px">
+          <button id="musicToggle" type="button">Music: off</button>
+          <label for="musicVol" class="hint" style="margin: 0">Volume</label>
+          <input
+            id="musicVol"
+            type="range"
+            min="0"
+            max="100"
+            value="70"
+            style="width: 160px"
+          />
+          <span class="hint" id="musicHint"></span>
+        </div>
       </section>
 
       <section class="panel">
@@ -332,6 +363,12 @@
       const startBtn = document.getElementById("start");
       const modeSingleBtn = document.getElementById("modeSingle");
       const modeStoryBtn = document.getElementById("modeStory");
+      const singleParams = document.getElementById("singleParams");
+      const promptField = document.getElementById("promptField");
+      const music = document.getElementById("music");
+      const musicToggle = document.getElementById("musicToggle");
+      const musicVol = document.getElementById("musicVol");
+      const musicHint = document.getElementById("musicHint");
       const storyPanel = document.getElementById("storyPanel");
       const storyText = document.getElementById("storyText");
       const storyHint = document.getElementById("storyHint");
@@ -348,7 +385,9 @@
       const DEFAULT_TRANSITION = "cut";
       const DEFAULT_SEED = 42;
 
-      let storyboardMode = false;
+      // Storyboard is the default mode; setStoryboardMode(true) at init syncs
+      // the DOM to it.
+      let storyboardMode = true;
       let parsedScenes = null;
       // True while a storyboard still has scenes to send, so a per-scene DONE
       // frame does not close the MediaSource on the scenes behind it.
@@ -802,8 +841,15 @@
         storyPanel.classList.toggle("hidden", !enabled);
         modeStoryBtn.classList.toggle("active", enabled);
         modeSingleBtn.classList.toggle("active", !enabled);
-        // num_frames/duration only describe a single-prompt request; a
-        // storyboard carries its length per scene.
+        // num_frames/duration/prompt only describe a single-prompt request; a
+        // storyboard carries its length and text per scene. Hide them rather
+        // than grey them out -- a disabled field showing "401 frames / 50.13 s"
+        // next to a 7-scene board reads like it still applies to the run.
+        singleParams.classList.toggle("hidden", enabled);
+        promptField.classList.toggle("hidden", enabled);
+        frameHint.classList.toggle("hidden", enabled);
+        // Keep the disables: hidden inputs are still submitted-from by the
+        // single-prompt path, and this is what stops a stale value being read.
         numFramesInput.disabled = enabled;
         secondsInput.disabled = enabled;
         promptInput.disabled = enabled;
@@ -1054,6 +1100,30 @@
       }
 
       baseUrlInput.value = inferBaseUrl();
+      // The model id is whatever path the workers were launched with, so any
+      // baked-in default is wrong on every box but the one it was written on.
+      // Ask the frontend instead, same spirit as inferBaseUrl() above. The
+      // field stays editable and keeps its current value if the fetch fails,
+      // and we do not clobber a value the user has already typed.
+      (async () => {
+        const typedBefore = modelInput.value.trim();
+        try {
+          const res = await fetch(`${baseUrlInput.value.replace(/\/$/, "")}/v1/models`);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const payload = await res.json();
+          const entry = payload && payload.data && payload.data[0];
+          const id = entry && entry.id;
+          if (!id) throw new Error("no model registered yet");
+          if (modelInput.value.trim() !== typedBefore) return;
+          modelInput.value = id;
+          appendLog(`Model: ${id}`);
+        } catch (err) {
+          appendLog(
+            `Could not read /v1/models (${err.message}); check the Model field ` +
+              `matches the path the stack was launched with.`
+          );
+        }
+      })();
       // Normalize the default frame count/duration and render the hint.
       syncFrameFields(Number.parseFloat(numFramesInput.value), readFps());
       browserHint.textContent = `MediaSource support: ${"MediaSource" in window ? "yes" : "no"}`;
@@ -1172,8 +1242,66 @@
       window.addEventListener("dragover", (event) => event.preventDefault());
       window.addEventListener("drop", (event) => event.preventDefault());
 
+      // ---- background music -------------------------------------------------
+      const DEFAULT_MUSIC = "underwater_theme.mp3";
+      const musicTrack =
+        new URLSearchParams(window.location.search).get("music") || DEFAULT_MUSIC;
+      let musicOn = false;
+
+      music.src = musicTrack;
+      music.volume = Number(musicVol.value) / 100;
+
+      function renderMusicState() {
+        musicToggle.textContent = `Music: ${musicOn ? "on" : "off"}`;
+        musicToggle.classList.toggle("active", musicOn);
+      }
+
+      musicVol.addEventListener("input", () => {
+        music.volume = Number(musicVol.value) / 100;
+      });
+
+      musicToggle.addEventListener("click", async () => {
+        musicOn = !musicOn;
+        renderMusicState();
+        if (!musicOn) {
+          music.pause();
+          musicHint.textContent = "";
+          return;
+        }
+        try {
+          // Start immediately, even with the player idle. Waiting for the video
+          // to roll (the old `if (!player.paused)` guard) meant clicking Music
+          // before a render left the button reading "on" in silence -- and it
+          // squandered the click, which is the one user gesture the browser's
+          // autoplay policy accepts as permission to sound.
+          await music.play();
+          // Report what is actually happening, not merely that play() resolved.
+          // "Music: on" while silent is exactly the state that hid the earlier
+          // bug, so surface a stalled/muted element instead of implying sound.
+          const silent = music.paused || music.muted || music.volume === 0;
+          musicHint.textContent = silent
+            ? `${musicTrack} loaded but silent -- check the volume slider and your system output`
+            : `${musicTrack} playing (loops every ${Math.round(music.duration || 48)}s)`;
+        } catch (error) {
+          musicOn = false;
+          renderMusicState();
+          musicHint.textContent = `Could not play ${musicTrack}: ${describeError(error)}`;
+        }
+      });
+
+      // Keep the bed in step with the video without touching the stream logic.
+      // Only the toggle decides whether music is on; the video's own pauses do
+      // not silence it. MSE stalls the player briefly between appends, and
+      // treating every one of those as "stop the music" chopped the track up.
+      player.addEventListener("play", () => {
+        if (musicOn) music.play().catch(() => {});
+      });
+      renderMusicState();
+
       storyText.value = JSON.stringify(EXAMPLE_STORYBOARD, null, 2);
-      setStoryboardMode(false);
+      // Storyboard is the default: the prefilled coral_reef board runs without
+      // typing anything, and multi-scene is what this pipeline is built for.
+      setStoryboardMode(true);
     </script>
   </body>
 </html>
