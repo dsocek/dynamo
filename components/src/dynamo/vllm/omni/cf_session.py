@@ -22,9 +22,17 @@ Wire format, one annotation per directive::
 
 ``cf_scene`` carries:
 
-    transition  "cut" (new location, drops history) or "continue" (default)
-    latents     scene length in latent frames; omitted -> pipeline default
-    seed        per-scene noise seed (see below)
+    transition    "cut" (new location, drops history) or "continue" (default)
+    latents       scene length in latent frames; omitted -> pipeline default
+    seed          per-scene noise seed (see below)
+    audio_offset  seconds of session timeline already played, so this scene's
+                  audio continues the bed instead of restarting it (see below)
+
+``audio_offset`` exists because a storyboard is N chained requests and each one
+packages its own audio track from the top of the source file. Restarting the bed
+every few seconds sounds broken. The client already tracks the cumulative
+timeline it applies as the MSE ``timestampOffset``, so it is the one component
+that knows the answer, and passing it here costs the router no state.
 
 ``seed`` reproduces a shot. For a ``cut`` that is exact: a cut zeroes the attention
 history, so the same seed and prompt give the same pixels. A ``continue`` also attends
@@ -74,16 +82,37 @@ class CFSceneRequest:
     transition: str = "continue"
     latents: int | None = None
     seed: int | None = None
+    audio_offset: float | None = None
 
     def push_kwargs(self) -> dict[str, Any]:
         """Kwargs for the worker's ``session_push``, omitting unset fields so the
-        pipeline's own defaults apply rather than ones invented here."""
+        pipeline's own defaults apply rather than ones invented here.
+
+        ``audio_offset`` is deliberately absent: it is a router-side packaging
+        concern and the worker has no business knowing about it.
+        """
         kwargs: dict[str, Any] = {"transition": self.transition}
         if self.latents is not None:
             kwargs["latents"] = self.latents
         if self.seed is not None:
             kwargs["seed"] = self.seed
         return kwargs
+
+    def num_frames(self) -> int | None:
+        """Frames this scene will produce, or None when it did not state a length.
+
+        The VAE compresses time 4x and the first latent decodes to a single frame,
+        so ``latents`` latent frames become ``4 * latents - 3`` pixel frames (18
+        latents -> 69). Mirrors the client's own ``sceneFrames``; the two must
+        agree, because the client derives the presentation timeline from it and
+        the router derives the audio length from it.
+
+        None when ``latents`` is unset, meaning the pipeline default applies and
+        only the pipeline knows the answer.
+        """
+        if self.latents is None:
+            return None
+        return 4 * self.latents - 3
 
 
 @dataclass(frozen=True)
@@ -141,12 +170,13 @@ def _parse_scene(payload: str) -> CFSceneRequest:
             f"{CF_SCENE_PREFIX}<json> must be a JSON object, got {type(raw).__name__}."
         )
 
-    unknown = set(raw) - {"transition", "latents", "seed"}
+    unknown = set(raw) - {"transition", "latents", "seed", "audio_offset"}
     if unknown:
         # Refuse rather than ignore: a typo'd key would otherwise silently fall back
         # to the default and render the wrong shot.
         raise CFSessionRequestError(
-            f"unknown cf_scene field(s) {sorted(unknown)}; allowed: transition, latents, seed."
+            f"unknown cf_scene field(s) {sorted(unknown)}; allowed: "
+            "transition, latents, seed, audio_offset."
         )
 
     transition = raw.get("transition", "continue")
@@ -157,7 +187,13 @@ def _parse_scene(payload: str) -> CFSceneRequest:
 
     latents = _coerce_int(raw, "latents", minimum=1)
     seed = _coerce_int(raw, "seed")
-    return CFSceneRequest(transition=transition, latents=latents, seed=seed)
+    audio_offset = _coerce_float(raw, "audio_offset", minimum=0.0)
+    return CFSceneRequest(
+        transition=transition,
+        latents=latents,
+        seed=seed,
+        audio_offset=audio_offset,
+    )
 
 
 def _coerce_int(raw: dict, key: str, *, minimum: int | None = None) -> int | None:
@@ -169,6 +205,27 @@ def _coerce_int(raw: dict, key: str, *, minimum: int | None = None) -> int | Non
         raise CFSessionRequestError(
             f"cf_scene.{key} must be an integer, got {value!r}."
         )
+    if minimum is not None and value < minimum:
+        raise CFSessionRequestError(
+            f"cf_scene.{key} must be >= {minimum}, got {value}."
+        )
+    return value
+
+
+def _coerce_float(
+    raw: dict, key: str, *, minimum: float | None = None
+) -> float | None:
+    value = raw.get(key)
+    if value is None:
+        return None
+    # An int is a fine float here (0 seconds), a bool is not.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CFSessionRequestError(
+            f"cf_scene.{key} must be a number, got {value!r}."
+        )
+    value = float(value)
+    if value != value or value in (float("inf"), float("-inf")):
+        raise CFSessionRequestError(f"cf_scene.{key} must be finite, got {value!r}.")
     if minimum is not None and value < minimum:
         raise CFSessionRequestError(
             f"cf_scene.{key} must be >= {minimum}, got {value}."
@@ -229,6 +286,7 @@ def build_cf_annotations(
     transition: str | None = None,
     latents: int | None = None,
     seed: int | None = None,
+    audio_offset: float | None = None,
     close: bool = False,
 ) -> list[str]:
     """Build the annotation list a client sends. Used by tests and example clients so
@@ -241,6 +299,8 @@ def build_cf_annotations(
         scene["latents"] = latents
     if seed is not None:
         scene["seed"] = seed
+    if audio_offset is not None:
+        scene["audio_offset"] = audio_offset
     if scene:
         annotations.append(
             f"{CF_SCENE_PREFIX}{json.dumps(scene, separators=(',', ':'), sort_keys=True)}"

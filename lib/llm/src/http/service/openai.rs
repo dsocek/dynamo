@@ -85,11 +85,24 @@ const VIDEO_STREAM_BINARY_CMAF_ANNOTATION: &str = "experimental_binary_cmaf";
 const VIDEO_STREAM_BINARY_CMAF_METADATA_TAG: &str = "cmaf:metadata";
 const VIDEO_STREAM_BINARY_CMAF_INIT_TAG: &str = "cmaf:init";
 const VIDEO_STREAM_BINARY_CMAF_SEGMENT_PREFIX: &str = "cmaf:segment:";
+// Second CMAF track. Audio is delivered as its own fragmented-MP4 track rather
+// than muxed into the video one, so it carries its own init and its own media
+// segments and the client appends them to a separate MSE SourceBuffer.
+const VIDEO_STREAM_BINARY_CMAF_AUDIO_INIT_TAG: &str = "cmaf:audio:init";
+const VIDEO_STREAM_BINARY_CMAF_AUDIO_SEGMENT_PREFIX: &str = "cmaf:audio:segment:";
+// A *non-fatal* audio failure. Distinct from a `status == "failed"` response,
+// which aborts the whole stream (see `decode_video_binary_cmaf_payloads`): when
+// only the audio track dies the video track is still good, so this is delivered
+// as an ordinary payload that happens to carry the ERROR kind. The client logs
+// it and stops expecting audio.
+const VIDEO_STREAM_BINARY_CMAF_AUDIO_ERROR_TAG: &str = "cmaf:audio:error";
 const VIDEO_STREAM_BINARY_CMAF_KIND_METADATA: u8 = 0x01;
 const VIDEO_STREAM_BINARY_CMAF_KIND_INIT: u8 = 0x02;
 const VIDEO_STREAM_BINARY_CMAF_KIND_SEGMENT: u8 = 0x03;
 const VIDEO_STREAM_BINARY_CMAF_KIND_ERROR: u8 = 0x04;
 const VIDEO_STREAM_BINARY_CMAF_KIND_DONE: u8 = 0x05;
+const VIDEO_STREAM_BINARY_CMAF_KIND_AUDIO_INIT: u8 = 0x06;
+const VIDEO_STREAM_BINARY_CMAF_KIND_AUDIO_SEGMENT: u8 = 0x07;
 
 use super::error::{SanitizedError, overload_status_code};
 
@@ -3165,12 +3178,22 @@ fn decode_video_binary_cmaf_payloads(
         let kind = match tag.as_str() {
             VIDEO_STREAM_BINARY_CMAF_METADATA_TAG => VIDEO_STREAM_BINARY_CMAF_KIND_METADATA,
             VIDEO_STREAM_BINARY_CMAF_INIT_TAG => VIDEO_STREAM_BINARY_CMAF_KIND_INIT,
+            VIDEO_STREAM_BINARY_CMAF_AUDIO_INIT_TAG => {
+                VIDEO_STREAM_BINARY_CMAF_KIND_AUDIO_INIT
+            }
+            VIDEO_STREAM_BINARY_CMAF_AUDIO_ERROR_TAG => VIDEO_STREAM_BINARY_CMAF_KIND_ERROR,
+            // Checked before the video prefix only for readability; the two
+            // prefixes are disjoint (`cmaf:audio:segment:` vs `cmaf:segment:`).
+            _ if tag.starts_with(VIDEO_STREAM_BINARY_CMAF_AUDIO_SEGMENT_PREFIX) => {
+                VIDEO_STREAM_BINARY_CMAF_KIND_AUDIO_SEGMENT
+            }
             _ if tag.starts_with(VIDEO_STREAM_BINARY_CMAF_SEGMENT_PREFIX) => {
                 VIDEO_STREAM_BINARY_CMAF_KIND_SEGMENT
             }
             _ => {
                 return Err(format!(
-                    "Unexpected CMAF payload tag `{tag}`; expected metadata, init, or segment"
+                    "Unexpected CMAF payload tag `{tag}`; expected metadata, init, \
+                     segment, or one of the cmaf:audio:* tags"
                 ));
             }
         };

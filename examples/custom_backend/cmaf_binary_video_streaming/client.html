@@ -343,6 +343,10 @@
         SEGMENT: 0x03,
         ERROR: 0x04,
         DONE: 0x05,
+        // Audio is a second, independent CMAF track -- its own init and its own
+        // fragments, not muxed into the video ones.
+        AUDIO_INIT: 0x06,
+        AUDIO_SEGMENT: 0x07,
       };
 
       const logEl = document.getElementById("log");
@@ -396,15 +400,125 @@
       let abortController = null;
       let activeReader = null;
       let mediaSource = null;
-      let sourceBuffer = null;
       let objectUrl = null;
       let frameBuffer = new Uint8Array(0);
-      let appendQueue = [];
       let appendedCount = 0;
       let streamDone = false;
-      let initAppended = false;
       let metadata = null;
       const CONNECT_TIMEOUT_MS = 15000;
+
+      // One of these per CMAF track. Two tracks means two SourceBuffers, and
+      // `updating` / `updateend` are per buffer -- so the append queue has to be
+      // per buffer too. A single shared queue would gate video appends on the
+      // audio buffer being idle and vice versa, which is how a two-track stream
+      // deadlocks itself.
+      // `expected` gates the queue: pieces are queued before `sourceopen` fires
+      // and the buffer exists, so "no buffer yet" cannot be the discard test.
+      function makeTrack(name, expected) {
+        return {
+          name,
+          expected,
+          buffer: null,
+          queue: [],
+          initAppended: false,
+          onUpdateEnd: null,
+        };
+      }
+      const videoTrack = makeTrack("video", true);
+      const audioTrack = makeTrack("audio", false);
+
+      // ---- A/V diagnostics (?debug=1) ---------------------------------------
+      // "Video plays, no sound, nothing logged an error" has three very
+      // different causes -- bad audio bytes, audio never reaching the decoder,
+      // or a muted output -- and none of them is visible from the normal log.
+      // These are off by default because the buffered-range spam and holding
+      // every audio fragment in memory are only worth it while debugging.
+      const DEBUG_AV =
+        new URLSearchParams(window.location.search).get("debug") === "1";
+      // Exactly the audio bytes the browser was handed, in order, so they can be
+      // written out and played in something that is not MSE.
+      let audioPieces = [];
+
+      function describeRanges(buffer) {
+        if (!buffer) return "no buffer";
+        try {
+          const r = buffer.buffered;
+          if (!r.length) return "empty";
+          const parts = [];
+          for (let i = 0; i < r.length; i += 1) {
+            parts.push(`${r.start(i).toFixed(2)}-${r.end(i).toFixed(2)}`);
+          }
+          return parts.join(", ");
+        } catch (error) {
+          return `unreadable (${error.message})`;
+        }
+      }
+
+      // Decisive split: nonzero and growing means the browser is decoding audio,
+      // so the fault is downstream in output (element/tab/system mute). Stuck at
+      // zero means the bytes never reached the decoder, and the buffered ranges
+      // and track list say why. Chrome/Edge only.
+      function decodeCounters() {
+        const audioBytes = player.webkitAudioDecodedByteCount;
+        const videoBytes = player.webkitVideoDecodedByteCount;
+        return (
+          `audioDecodedBytes=${audioBytes === undefined ? "n/a" : audioBytes} ` +
+          `videoDecodedBytes=${videoBytes === undefined ? "n/a" : videoBytes} ` +
+          `audioTracks=${player.audioTracks ? player.audioTracks.length : "n/a"} ` +
+          `muted=${player.muted} volume=${player.volume.toFixed(2)} ` +
+          `activeSourceBuffers=${mediaSource ? mediaSource.activeSourceBuffers.length : "n/a"}`
+        );
+      }
+
+      function logAvDiagnostics(label) {
+        appendLog(`[av] ${label}: ${decodeCounters()}`);
+        appendLog(`[av]   video buffered: ${describeRanges(videoTrack.buffer)}`);
+        appendLog(`[av]   audio buffered: ${describeRanges(audioTrack.buffer)}`);
+      }
+
+      // Writes init + every audio fragment as one fMP4. If that file plays
+      // elsewhere the encoder and the wire framing are both fine and the bug is
+      // in the MSE wiring; if it does not, it never was a client problem.
+      function saveAudioTrack() {
+        if (!audioPieces.length) {
+          appendLog("[av] no audio bytes captured (reload with ?debug=1)", true);
+          return;
+        }
+        const blob = new Blob(audioPieces, { type: "audio/mp4" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "cmaf-audio-track.mp4";
+        link.click();
+        // Deferred: revoking in the same tick can cancel the download.
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+        appendLog(
+          `[av] wrote cmaf-audio-track.mp4 (${audioPieces.length} pieces, ${blob.size} bytes)`
+        );
+      }
+
+      // Console handle: everything above lives in a closure, so without this
+      // there is no way to inspect state from DevTools.
+      window.__cmaf = {
+        player,
+        videoTrack,
+        audioTrack,
+        get mediaSource() {
+          return mediaSource;
+        },
+        get metadata() {
+          return metadata;
+        },
+        counters: decodeCounters,
+        ranges: describeRanges,
+        saveAudio: saveAudioTrack,
+      };
+
+      // Tracks with a live SourceBuffer. Audio joins only if metadata announced
+      // it and the browser accepted its mime type.
+      function activeTracks() {
+        return [videoTrack, audioTrack].filter((t) => t.buffer !== null);
+      }
 
       // --- Frame-count coupling -------------------------------------------
       // Causal-forcing Wan needs num_frames on its latent grid. The VAE
@@ -523,10 +637,18 @@
           abortController.abort();
           abortController = null;
         }
-        if (sourceBuffer) {
-          sourceBuffer.removeEventListener("updateend", onSourceBufferUpdateEnd);
-          sourceBuffer = null;
+        for (const track of [videoTrack, audioTrack]) {
+          if (track.buffer && track.onUpdateEnd) {
+            track.buffer.removeEventListener("updateend", track.onUpdateEnd);
+          }
+          track.buffer = null;
+          track.onUpdateEnd = null;
+          track.queue = [];
+          track.initAppended = false;
         }
+        // Video is always expected; audio only once metadata says so.
+        videoTrack.expected = true;
+        audioTrack.expected = false;
         if (mediaSource && mediaSource.readyState === "open") {
           try {
             mediaSource.endOfStream();
@@ -534,10 +656,9 @@
         }
         mediaSource = null;
         frameBuffer = new Uint8Array(0);
-        appendQueue = [];
         appendedCount = 0;
+        audioPieces = [];
         streamDone = false;
-        initAppended = false;
         moreScenesPending = false;
         metadata = null;
         if (objectUrl) {
@@ -554,13 +675,22 @@
       }
 
       function setQueuedStat() {
-        setStat(queueStat, `Queued: ${appendQueue.length}`);
+        const total = [videoTrack, audioTrack].reduce(
+          (n, t) => n + t.queue.length,
+          0
+        );
+        setStat(queueStat, `Queued: ${total}`);
       }
 
-      function onSourceBufferUpdateEnd() {
+      function onTrackUpdateEnd(track) {
         appendedCount += 1;
         setStat(appendStat, `Appended: ${appendedCount}`);
-        pumpAppendQueue();
+        if (DEBUG_AV) {
+          appendLog(
+            `[av] ${track.name} appended, buffered ${describeRanges(track.buffer)}`
+          );
+        }
+        pumpAppendQueue(track);
         if (player.paused) {
           player.play().catch((error) => {
             appendLog(`Playback is waiting for a manual play click: ${error.message}`);
@@ -568,90 +698,233 @@
         }
       }
 
+      function addTrackBuffer(track, mimeType) {
+        const buffer = mediaSource.addSourceBuffer(mimeType);
+        buffer.mode = "segments";
+        track.buffer = buffer;
+        track.onUpdateEnd = () => onTrackUpdateEnd(track);
+        buffer.addEventListener("updateend", track.onUpdateEnd);
+        // A media segment the parser rejects does not throw from appendBuffer --
+        // it fires `error` here and silently drops the data. Without this
+        // listener a whole unusable track looks exactly like a working one.
+        buffer.addEventListener("error", () => {
+          appendLog(
+            `SourceBuffer (${track.name}) reported a parse/decode error; ` +
+              `buffered ${describeRanges(buffer)}`,
+            true
+          );
+        });
+        appendLog(`SourceBuffer (${track.name}) ready with ${mimeType}`);
+      }
+
       function ensureMediaSource(meta) {
         if (!("MediaSource" in window)) {
           throw new Error("This browser does not support MediaSource Extensions");
         }
+        // Only the first scene of a presentation decides the track layout; a
+        // later scene must not resurrect a track that was dropped.
         if (mediaSource) {
           return;
         }
+
+        // Decided here, synchronously, rather than in the `sourceopen` handler:
+        // init and media pieces arrive before that fires, and `expected` is what
+        // says whether to queue them.
+        audioTrack.expected = Boolean(
+          meta.has_audio && meta.audio_source_buffer_mime_type
+        );
 
         mediaSource = new MediaSource();
         objectUrl = URL.createObjectURL(mediaSource);
         player.src = objectUrl;
         player.load();
 
+        // An unrecoverable decode error closes the MediaSource rather than
+        // raising anywhere we already look.
+        mediaSource.addEventListener("sourceclose", () => {
+          appendLog("MediaSource closed", true);
+        });
+        player.addEventListener(
+          "error",
+          () => {
+            const err = player.error;
+            appendLog(
+              `Media element error: ${err ? `${err.code} ${err.message}` : "unknown"}`,
+              true
+            );
+          },
+          { once: true }
+        );
+
         mediaSource.addEventListener(
           "sourceopen",
           () => {
             try {
-              sourceBuffer = mediaSource.addSourceBuffer(meta.source_buffer_mime_type);
-              sourceBuffer.mode = "segments";
-              sourceBuffer.addEventListener("updateend", onSourceBufferUpdateEnd);
-              appendLog(`MediaSource ready with ${meta.source_buffer_mime_type}`);
-              pumpAppendQueue();
+              addTrackBuffer(videoTrack, meta.source_buffer_mime_type);
             } catch (error) {
               appendLog(`Failed to create SourceBuffer: ${error.message}`, true);
+              return;
+            }
+            // Both buffers are created here, from metadata, before any append:
+            // browsers are unreliable about adding a second buffer once the
+            // first holds data. This is why the server gates its metadata frame
+            // on having both init segments in hand.
+            if (audioTrack.expected) {
+              try {
+                addTrackBuffer(audioTrack, meta.audio_source_buffer_mime_type);
+              } catch (error) {
+                // Degrade to video-only rather than fail: clearing `expected`
+                // makes the audio fragments that follow cheap to discard.
+                audioTrack.expected = false;
+                audioTrack.queue = [];
+                setQueuedStat();
+                setStat(audioStat, "Audio: unsupported");
+                appendLog(
+                  `No audio SourceBuffer (${meta.audio_source_buffer_mime_type}): ` +
+                    `${error.message} -- playing video only`,
+                  true
+                );
+              }
+            }
+            for (const track of activeTracks()) {
+              pumpAppendQueue(track);
             }
           },
           { once: true }
         );
       }
 
-      // The queue carries two kinds of item: media bytes to append, and
-      // timeline marks. A mark must be applied at exactly the point in the
-      // byte order where it was issued -- appends are asynchronous, so setting
+      // A queue carries two kinds of item: media bytes to append, and timeline
+      // marks. A mark must be applied at exactly the point in the byte order
+      // where it was issued -- appends are asynchronous, so setting
       // timestampOffset directly when a scene starts would land on whatever
       // fragment happened to be in flight.
-      function queueAppend(bytes) {
-        appendQueue.push({ kind: "bytes", data: bytes });
+      function queueAppend(track, bytes) {
+        track.queue.push({ kind: "bytes", data: bytes });
         setQueuedStat();
-        pumpAppendQueue();
+        pumpAppendQueue(track);
       }
 
       function queueTimelineOffset(seconds, sceneNumber) {
-        appendQueue.push({ kind: "offset", value: seconds, scene: sceneNumber });
+        // Every track has its own timeline, so every track needs the mark.
+        for (const track of [videoTrack, audioTrack]) {
+          track.queue.push({ kind: "offset", value: seconds, scene: sceneNumber });
+          pumpAppendQueue(track);
+        }
         setQueuedStat();
-        pumpAppendQueue();
       }
 
-      function pumpAppendQueue() {
-        if (!sourceBuffer || sourceBuffer.updating) {
+      // Every chained scene sends its own init fragment for each track. The moov
+      // only needs appending once per track -- a second one mid-stream
+      // re-initializes that SourceBuffer and resets its timeline, undoing
+      // timestampOffset. The guard is therefore per track, not global.
+      function queueInit(track, payload) {
+        if (!track.expected) {
+          return;
+        }
+        if (track.initAppended) {
+          appendLog(
+            `Skipping repeat ${track.name} init fragment (${payload.length} bytes)`
+          );
+          return;
+        }
+        appendLog(`Received ${track.name} init fragment (${payload.length} bytes)`);
+        track.initAppended = true;
+        if (DEBUG_AV && track === audioTrack) {
+          audioPieces.push(payload);
+        }
+        queueAppend(track, payload);
+      }
+
+      function pumpAppendQueue(track) {
+        if (!track.buffer || track.buffer.updating) {
           return;
         }
         // Marks are synchronous: drain any sitting at the head before the
         // append behind them, so the offset is in force for those bytes.
-        while (appendQueue.length > 0 && appendQueue[0].kind === "offset") {
-          const mark = appendQueue.shift();
+        while (track.queue.length > 0 && track.queue[0].kind === "offset") {
+          const mark = track.queue.shift();
           try {
-            sourceBuffer.timestampOffset = mark.value;
+            track.buffer.timestampOffset = mark.value;
             appendLog(
-              `Timeline offset -> ${mark.value.toFixed(2)}s for scene ${mark.scene}`
+              `Timeline offset (${track.name}) -> ${mark.value.toFixed(2)}s ` +
+                `for scene ${mark.scene}`
             );
           } catch (error) {
             appendLog(`Could not set timestampOffset: ${error.message}`, true);
           }
         }
-        if (appendQueue.length === 0) {
+        if (track.queue.length === 0) {
           setQueuedStat();
-          if (streamDone && mediaSource && mediaSource.readyState === "open") {
-            try {
-              mediaSource.endOfStream();
-              appendLog("MediaSource ended cleanly");
-            } catch (error) {
-              appendLog(`endOfStream failed: ${error.message}`, true);
-            }
-          }
+          maybeEndOfStream();
           return;
         }
 
-        const next = appendQueue.shift();
+        const next = track.queue.shift();
         setQueuedStat();
         try {
-          sourceBuffer.appendBuffer(next.data);
+          track.buffer.appendBuffer(next.data);
         } catch (error) {
-          appendLog(`appendBuffer failed: ${error.message}`, true);
+          appendLog(`appendBuffer failed (${track.name}): ${error.message}`, true);
         }
+      }
+
+      // endOfStream() throws while any buffer is mid-append, and closing the
+      // source with the other track still holding queued bytes would truncate
+      // it -- so every active track has to be drained and idle first.
+      function maybeEndOfStream() {
+        if (!streamDone || !mediaSource || mediaSource.readyState !== "open") {
+          return;
+        }
+        const busy = activeTracks().some(
+          (t) => t.queue.length > 0 || t.buffer.updating
+        );
+        if (busy) {
+          return;
+        }
+        try {
+          mediaSource.endOfStream();
+          appendLog("MediaSource ended cleanly");
+          logAvDiagnostics("at end of stream");
+        } catch (error) {
+          appendLog(`endOfStream failed: ${error.message}`, true);
+        }
+      }
+
+      // An audio-only failure must not tear down playback: the video track is
+      // still complete and valid. Dropping the buffer is what lets playback pass
+      // the point audio stopped -- MSE will not advance currentTime while an
+      // active SourceBuffer has no data there.
+      function dropAudioTrack(reason) {
+        if (!audioTrack.expected && !audioTrack.buffer) {
+          return;
+        }
+        const buffer = audioTrack.buffer;
+        if (buffer && audioTrack.onUpdateEnd) {
+          buffer.removeEventListener("updateend", audioTrack.onUpdateEnd);
+        }
+        audioTrack.buffer = null;
+        audioTrack.onUpdateEnd = null;
+        audioTrack.queue = [];
+        audioTrack.initAppended = false;
+        // Cleared even if the buffer was never created (the error can beat
+        // `sourceopen`), so later audio fragments are discarded rather than
+        // queued against nothing.
+        audioTrack.expected = false;
+        if (buffer && mediaSource) {
+          try {
+            mediaSource.removeSourceBuffer(buffer);
+          } catch (error) {
+            appendLog(
+              `Could not remove the audio SourceBuffer: ${error.message}`,
+              true
+            );
+          }
+        }
+        setStat(audioStat, "Audio: dropped");
+        appendLog(`Audio track dropped: ${reason}`, true);
+        setQueuedStat();
+        maybeEndOfStream();
       }
 
       function concatUint8Arrays(left, right) {
@@ -685,30 +958,42 @@
           case FRAME_KIND.METADATA: {
             metadata = JSON.parse(textDecoder.decode(payload));
             setStat(modeStat, "Mode: streaming");
-            setStat(audioStat, `Audio: ${metadata.has_audio ? "yes" : "no"}`);
             appendLog(`Metadata: ${JSON.stringify(metadata, null, 2)}`);
             ensureMediaSource(metadata);
+            setStat(audioStat, `Audio: ${audioTrack.expected ? "yes" : "no"}`);
             break;
           }
           case FRAME_KIND.INIT:
-            // Every chained scene sends its own init fragment. The moov only
-            // needs appending once -- a second one mid-stream re-initializes the
-            // SourceBuffer and resets its timeline, undoing timestampOffset.
-            if (initAppended) {
-              appendLog(`Skipping repeat init fragment (${payload.length} bytes)`);
-            } else {
-              appendLog(`Received init fragment (${payload.length} bytes)`);
-              initAppended = true;
-              queueAppend(payload);
-            }
+            queueInit(videoTrack, payload);
             break;
           case FRAME_KIND.SEGMENT:
             appendLog(`Received media fragment (${payload.length} bytes)`);
-            queueAppend(payload);
+            queueAppend(videoTrack, payload);
+            break;
+          case FRAME_KIND.AUDIO_INIT:
+            queueInit(audioTrack, payload);
+            break;
+          case FRAME_KIND.AUDIO_SEGMENT:
+            if (!audioTrack.expected) {
+              // Unusable mime type, or already dropped. Discarding beats
+              // buffering fragments nothing will ever append.
+              break;
+            }
+            appendLog(`Received audio fragment (${payload.length} bytes)`);
+            if (DEBUG_AV) {
+              audioPieces.push(payload);
+            }
+            queueAppend(audioTrack, payload);
             break;
           case FRAME_KIND.ERROR: {
             const decoded = JSON.parse(textDecoder.decode(payload));
-            appendLog(`Worker stream error: ${decoded.error}`, true);
+            // Same wire kind for both, so the payload's `track` field is what
+            // distinguishes a dead audio track from a dead stream.
+            if (decoded.track === "audio") {
+              dropAudioTrack(decoded.error);
+            } else {
+              appendLog(`Worker stream error: ${decoded.error}`, true);
+            }
             break;
           }
           case FRAME_KIND.DONE:
@@ -721,7 +1006,7 @@
             } else {
               streamDone = true;
             }
-            pumpAppendQueue();
+            maybeEndOfStream();
             break;
           default:
             appendLog(`Unknown frame kind ${kind}`, true);
@@ -977,7 +1262,7 @@
           // buffer open forever.
           moreScenesPending = false;
           streamDone = true;
-          pumpAppendQueue();
+          maybeEndOfStream();
           setStat(modeStat, "Mode: complete");
           streamInFlight = false;
           startBtn.disabled = false;
@@ -1054,6 +1339,13 @@
                 transition: scene.transition,
                 latents: scene.latents,
                 seed: scene.seed,
+                // Each scene is a separate request that packages its own audio
+                // track, so without this the music bed restarts from the top
+                // every few seconds and sounds broken. We are the component that
+                // knows where the timeline is -- it is the same number we apply
+                // as timestampOffset above -- so we tell the router where in the
+                // source to resume.
+                audio_offset: timelineSeconds,
               }),
             BINARY_CMAF_ANNOTATION,
           ];
@@ -1297,6 +1589,17 @@
         if (musicOn) music.play().catch(() => {});
       });
       renderMusicState();
+
+      // Injected rather than written into the markup so the normal UI is
+      // unchanged; ?debug=1 is a debugging session, not a feature.
+      if (DEBUG_AV) {
+        const saveBtn = document.createElement("button");
+        saveBtn.type = "button";
+        saveBtn.textContent = "Save audio track";
+        saveBtn.addEventListener("click", saveAudioTrack);
+        musicToggle.parentNode.appendChild(saveBtn);
+        appendLog("[av] debug mode on: buffered ranges logged, audio captured");
+      }
 
       storyText.value = JSON.stringify(EXAMPLE_STORYBOARD, null, 2);
       // Storyboard is the default: the prefilled coral_reef board runs without

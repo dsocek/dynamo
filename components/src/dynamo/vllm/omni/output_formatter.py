@@ -29,14 +29,21 @@ from dynamo.common.utils.output_modalities import RequestType
 from dynamo.common.utils.video_utils import StreamingCmafEncoder, encode_video
 from dynamo.vllm.handlers import build_prompt_tokens_details
 from dynamo.vllm.omni.cmaf_video import (
+    CMAF_AUDIO_ERROR_TAG,
+    CMAF_AUDIO_INIT_TAG,
+    CMAF_AUDIO_SEGMENT_PREFIX,
     CMAF_FALLBACK_VIDEO_CODEC,
     CMAF_INIT_TAG,
     CMAF_METADATA_TAG,
     CMAF_SEGMENT_PREFIX,
+    audio_error_bytes,
+    cmaf_audio_frag_seconds,
+    cmaf_audio_lead_seconds,
     cmaf_emit_cadence_s,
     cmaf_gop_frames,
     cmaf_segment_seconds,
     metadata_bytes,
+    stream_audio_file_to_cmaf,
     stream_frames_to_cmaf,
 )
 from dynamo.vllm.omni.utils import is_empty_payload
@@ -86,6 +93,147 @@ class _AsyncFragments:
             return
         self._closed = True
         await asyncio.to_thread(self._gen.close)
+
+
+class AudioTrack:
+    """The audio side of a two-track CMAF stream, pulled one fragment at a time.
+
+    Owns a lazy :func:`stream_audio_file_to_cmaf` generator plus the bookkeeping a
+    caller needs to interleave it against video: how many seconds have been handed
+    out, and whether the track is still live.
+
+    Deliberately *not* a producer task. Nothing is encoded ahead of what the caller
+    has taken, so a track that is being throttled costs no memory, and the same
+    object works whether the source outruns realtime (a file) or lags it (a
+    worker). It is shared by both live CMAF paths in the router, which differ in
+    their video segment cadence but not in how audio is paced against it.
+
+    Failures are *soft*: :meth:`open` and :meth:`next_fragment` return None rather
+    than raising, recording the reason in :attr:`error`. A dead audio track must
+    never take a healthy video track with it.
+
+    ``source=None`` builds a permanently-disabled track. That is not a special
+    case bolted on -- it is what lets the A/V merge be the *only* live path in the
+    router: a video-only request is a request whose audio track is disabled, so
+    there is no second emit loop to keep in step with this one.
+    """
+
+    def __init__(
+        self,
+        source: Optional[str],
+        duration_s: float,
+        *,
+        frag_seconds: float | None = None,
+        start_s: float = 0.0,
+    ) -> None:
+        self._source = source
+        self._duration_s = duration_s
+        # Where in the source to start. Non-zero for a chained scene, so the bed
+        # continues across requests instead of restarting; invisible downstream,
+        # since the fragments produced still begin at timestamp 0.
+        self._start_s = start_s
+        self._frag_seconds = (
+            cmaf_audio_frag_seconds() if frag_seconds is None else frag_seconds
+        )
+        self._pieces: Optional[_AsyncFragments] = None
+        self._index = 0
+        self.codec: Optional[str] = None
+        self.init_bytes: Optional[bytes] = None
+        self.emitted_seconds = 0.0
+        self.done = source is None
+        self.error: Optional[str] = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._source is not None
+
+    @property
+    def frag_seconds(self) -> float:
+        """Nominal fragment duration used for the interleave watermark.
+
+        Nominal, not measured: the muxer cuts on codec frame boundaries so real
+        fragments differ slightly (an AAC-LC frame is 21.33 ms, so a requested
+        0.5 s lands near 0.512 s). That inaccuracy is affordable because the
+        watermark decides *delivery order* only -- both tracks carry their own
+        ``tfdt`` timestamps, so the browser's A/V sync is unaffected by it.
+        """
+        return self._frag_seconds
+
+    @property
+    def live(self) -> bool:
+        return not self.done and self.error is None
+
+    async def open(self) -> Optional[str]:
+        """Start the encoder and take its init segment. Returns the codec string.
+
+        Returns None on failure, having set :attr:`error`. Callers must treat that
+        as "no audio track" and carry on with video: this runs *before* the
+        metadata frame is sent precisely so ``has_audio`` can be truthful rather
+        than advertised and then retracted.
+
+        A disabled track (``source=None``) reports no codec and no error: nothing
+        went wrong, there is simply no audio.
+        """
+        if self._source is None:
+            return None
+        try:
+            self._pieces = _AsyncFragments(
+                stream_audio_file_to_cmaf(
+                    self._source,
+                    self._duration_s,
+                    frag_seconds=self._frag_seconds,
+                    start_s=self._start_s,
+                )
+            )
+            kind, payload, extra = await self._pieces.__anext__()
+        except StopAsyncIteration:
+            self._fail("audio encoder produced no output")
+            return None
+        except Exception as e:  # noqa: BLE001 -- degrade to video-only
+            self._fail(str(e))
+            return None
+
+        if kind != "init":
+            self._fail(f"expected an audio init segment first, got {kind!r}")
+            return None
+        self.codec, self.init_bytes = extra, payload
+        return self.codec
+
+    async def next_fragment(self) -> Optional[tuple[int, bytes]]:
+        """Take the next media fragment, or None when the track ends or fails.
+
+        Advances :attr:`emitted_seconds` by the nominal fragment duration, so the
+        caller's watermark stays in step without having to parse durations back
+        out of the fragment.
+        """
+        if self._pieces is None or not self.live:
+            return None
+        try:
+            kind, payload, extra = await self._pieces.__anext__()
+        except StopAsyncIteration:
+            self.done = True
+            return None
+        except Exception as e:  # noqa: BLE001 -- degrade to video-only
+            self._fail(str(e))
+            return None
+        if kind != "segment":
+            # A second init cannot happen with one encoder, but silently
+            # appending one to a SourceBuffer would reset its timeline.
+            self._fail(f"unexpected audio piece {kind!r} mid-stream")
+            return None
+        self.emitted_seconds += self._frag_seconds
+        self._index = extra + 1
+        return extra, payload
+
+    async def aclose(self) -> None:
+        """Reap the encoder. Safe to call whether or not the track was opened."""
+        if self._pieces is not None:
+            await self._pieces.aclose()
+
+    def _fail(self, message: str) -> None:
+        self.error = message
+        self.done = True
+        logger.warning("CMAF audio track (%s): %s", self._source, message)
 
 
 class TextFormatter:
@@ -519,6 +667,254 @@ class DiffusionFormatter:
             "Live CMAF stream for %s complete: %d segment(s)", request_id, emitted
         )
 
+    async def stream_av_cmaf_live(
+        self,
+        frame_chunks: Any,
+        request_id: str,
+        *,
+        fps: int,
+        audio: "AudioTrack",
+        video_duration_s: Optional[float] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """:meth:`stream_video_cmaf_live` with a second, independent audio track.
+
+        Sibling rather than an optional parameter, so a video-only request runs
+        exactly the code it runs today. The video half is identical -- the same
+        fragment generator over the same live ``frame_chunks``; all that is added
+        is a second track merged onto the same wire by
+        :meth:`_merge_av_cmaf`.
+
+        ``video_duration_s`` is the clip's real length when the caller knows it,
+        and it decides where audio is cut. See :meth:`_merge_av_cmaf`.
+        """
+        pieces = _AsyncFragments(
+            stream_frames_to_cmaf(frame_chunks, fps, cmaf_segment_seconds())
+        )
+        async for chunk in self._merge_av_cmaf(
+            pieces,
+            request_id,
+            audio=audio,
+            video_segment_seconds=float(cmaf_segment_seconds()),
+            video_duration_s=video_duration_s,
+        ):
+            yield chunk
+
+    async def _merge_av_cmaf(
+        self,
+        video_pieces: Any,
+        request_id: str,
+        *,
+        audio: "AudioTrack",
+        video_segment_seconds: float,
+        video_duration_s: Optional[float] = None,
+        created: Optional[int] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Merge a video piece stream and an audio track into one CMAF wire stream.
+
+        ``video_pieces`` is any async iterator of ``("init", bytes, codec)`` /
+        ``("segment", bytes, index)`` with an ``aclose()`` -- either
+        :class:`_AsyncFragments` over :func:`stream_frames_to_cmaf` or an adapter
+        around a persistent encoder. Both live router paths use this, which is why
+        the video cadence is a parameter: the fragment generator closes a segment
+        every ``DYN_CMAF_SEGMENT_SECONDS`` (2 s), the persistent encoder every
+        ``DYN_CMAF_GOP_FRAMES`` frames (0.25 s at the default 4 @ 16 fps).
+
+        **Ordering.** Metadata is gated on *both* inits, so ``has_audio`` and
+        ``audio_codec`` describe what will actually arrive rather than what was
+        hoped for -- the client creates both ``SourceBuffer``s from that one frame
+        and browsers are unreliable about adding a second one later::
+
+            METADATA -> VIDEO_INIT -> AUDIO_INIT -> <interleaved media> -> DONE
+
+        Gating costs nothing: an init is the first thing either muxer emits, ahead
+        of any media.
+
+        **Interleaving** is a watermark on the presentation timeline: emit from
+        whichever track has handed out fewer seconds, letting audio sit up to
+        ``DYN_CMAF_AUDIO_LEAD_SECONDS`` ahead. The lead is not symmetric because
+        MSE is not: playback stalls when *any* active ``SourceBuffer`` lacks data
+        at ``currentTime``, so audio starving is as fatal as video starving while
+        being far cheaper to prevent.
+
+        The watermark uses nominal durations, not durations parsed back out of
+        each fragment, and that is sound because it decides *delivery order only*.
+        Each track carries its own ``tfdt``/``trun`` written by its own muxer, so
+        the browser syncs by presentation time whatever order the bytes arrived
+        in. A drifting watermark costs smoothness; it cannot cost A/V sync.
+
+        **Where audio stops** is a different question, and nominal durations are
+        *not* good enough for it -- an over-long audio track is either wasted
+        encoding or, for a client stitching scenes onto one timeline, audible
+        drift. So ``video_duration_s`` is the authoritative total when the caller
+        knows it, and audio is cut there. Only when it is unknown does the cut
+        fall back to the accumulated nominal ``video_t``, which measurably
+        over-runs: 2 s nominal segments against ~1.7 s real ones over-produced
+        audio by 29% on a 69-frame scene.
+
+        A slow audio source therefore also throttles video delivery, since the
+        loop blocks on whichever track is behind. That is deliberate for now: it
+        keeps the wire ordered by presentation time and makes an audio underrun
+        show up as reduced throughput rather than as a mystery stall in the
+        browser. A real generator will want a silence-fill policy here instead.
+
+        Failure is per-track. A dead audio track yields one non-fatal
+        ``cmaf:audio:error`` item and stops; video runs to completion. A failed
+        :class:`NvVideosResponse` could not be used for that -- the frontend
+        aborts the whole stream on one.
+        """
+        created = int(time.time()) if created is None else created
+        cadence = cmaf_emit_cadence_s()
+        lead = cmaf_audio_lead_seconds()
+
+        video_t = 0.0
+        audio_t = 0.0
+        emitted = 0
+        audio_index = 0
+        video_done = False
+        audio_error_sent = False
+
+        try:
+            # --- Preamble: video init, then audio init, then metadata. ---
+            try:
+                kind, payload, extra = await video_pieces.__anext__()
+            except StopAsyncIteration:
+                raise RuntimeError("video encoder produced no output") from None
+            if kind != "init":
+                raise RuntimeError(f"expected a video init segment first, got {kind!r}")
+            video_codec = extra or CMAF_FALLBACK_VIDEO_CODEC
+            video_init = payload
+
+            audio_codec = await audio.open()
+            if audio_codec is None and audio.enabled:
+                logger.warning(
+                    "CMAF audio unavailable for %s (%s); streaming video-only",
+                    request_id,
+                    audio.error,
+                )
+
+            yield self._cmaf_chunk(
+                request_id,
+                created,
+                CMAF_METADATA_TAG,
+                metadata_bytes(
+                    None, cmaf_segment_seconds(), video_codec, audio_codec
+                ),
+                progress=0,
+            )
+            yield self._cmaf_chunk(
+                request_id, created, CMAF_INIT_TAG, video_init, progress=1
+            )
+            if audio_codec is not None and audio.init_bytes is not None:
+                yield self._cmaf_chunk(
+                    request_id,
+                    created,
+                    CMAF_AUDIO_INIT_TAG,
+                    audio.init_bytes,
+                    progress=1,
+                )
+
+            def audio_covered() -> bool:
+                """True once audio spans the whole video, so it should stop.
+
+                Audio is slaved to the video's duration and the encoder is only
+                ever asked for an upper bound, so somebody has to decide where to
+                cut. ``video_duration_s`` is that decision when the caller knows
+                it -- a scene of known length -- and it is checked even while
+                video is still arriving, because the nominal watermark runs ahead
+                of real fragments and would otherwise keep asking for audio past
+                the end of the clip.
+
+                Without it the only available answer is the accumulated nominal
+                ``video_t``, and that is usable only once video has finished: it
+                is a lower bound while segments are still coming.
+                """
+                if video_duration_s is not None:
+                    return audio_t >= video_duration_s
+                return video_done and audio_t >= video_t
+
+            # --- Media: whichever track is behind on the timeline. ---
+            while not video_done or (audio.live and not audio_covered()):
+                if not audio.live or audio_covered():
+                    take_audio = False
+                else:
+                    # A finished video track takes audio unconditionally: audio
+                    # already past the lead would otherwise spin taking neither.
+                    take_audio = video_done or audio_t <= video_t + lead
+
+                if take_audio:
+                    fragment = await audio.next_fragment()
+                    if fragment is None:
+                        if audio.error and not audio_error_sent:
+                            audio_error_sent = True
+                            yield self._cmaf_chunk(
+                                request_id,
+                                created,
+                                CMAF_AUDIO_ERROR_TAG,
+                                audio_error_bytes(audio.error),
+                                self._live_progress(emitted),
+                            )
+                        continue
+                    index, audio_payload = fragment
+                    audio_t = audio.emitted_seconds
+                    audio_index = index + 1
+                    yield self._cmaf_chunk(
+                        request_id,
+                        created,
+                        f"{CMAF_AUDIO_SEGMENT_PREFIX}{index}",
+                        audio_payload,
+                        self._live_progress(emitted),
+                    )
+                    continue
+
+                try:
+                    kind, payload, extra = await video_pieces.__anext__()
+                except StopAsyncIteration:
+                    video_done = True
+                    continue
+                if kind == "init":
+                    # One encoder emits one init; forwarded rather than dropped
+                    # only because the video-only paths do the same.
+                    yield self._cmaf_chunk(
+                        request_id, created, CMAF_INIT_TAG, payload, progress=1
+                    )
+                    continue
+                if cadence > 0:
+                    await asyncio.sleep(cadence)
+                emitted += 1
+                video_t += video_segment_seconds
+                yield self._cmaf_chunk(
+                    request_id,
+                    created,
+                    f"{CMAF_SEGMENT_PREFIX}{emitted - 1}",
+                    payload,
+                    self._live_progress(emitted),
+                )
+        except Exception as e:
+            # init and some segments are already with the client, so it holds a
+            # partial but valid asset. Saying so beats stopping silently, which
+            # is indistinguishable from a clip that simply ended.
+            logger.error(
+                "Live A/V CMAF streaming failed for request %s after %d video "
+                "segment(s) and %d audio fragment(s): %s",
+                request_id,
+                emitted,
+                audio_index,
+                e,
+            )
+            yield self._cmaf_failure(request_id, created, str(e))
+            return
+        finally:
+            await audio.aclose()
+            await video_pieces.aclose()
+
+        logger.info(
+            "Live A/V CMAF stream for %s complete: %d video segment(s), "
+            "%d audio fragment(s)",
+            request_id,
+            emitted,
+            audio_index,
+        )
+
     @staticmethod
     def _live_progress(emitted: int) -> int:
         """Progress for a stream whose length is not knowable.
@@ -892,6 +1288,48 @@ class OutputFormatter:
         """Delegate live binary-CMAF streaming to the diffusion formatter."""
         return self._formatters["image"].stream_video_cmaf_live(
             frame_chunks, request_id, fps=fps
+        )
+
+    def stream_av_cmaf_live(
+        self,
+        frame_chunks: Any,
+        request_id: str,
+        *,
+        fps: int,
+        audio: AudioTrack,
+        video_duration_s: Optional[float] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Delegate live binary-CMAF A/V streaming to the diffusion formatter."""
+        return self._formatters["image"].stream_av_cmaf_live(
+            frame_chunks,
+            request_id,
+            fps=fps,
+            audio=audio,
+            video_duration_s=video_duration_s,
+        )
+
+    def merge_av_cmaf(
+        self,
+        video_pieces: Any,
+        request_id: str,
+        *,
+        audio: AudioTrack,
+        video_segment_seconds: float,
+        video_duration_s: Optional[float] = None,
+        created: Optional[int] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Merge caller-supplied video pieces with an audio track.
+
+        For the router's persistent-encoder path, which owns its own video piece
+        source and so cannot use :meth:`stream_av_cmaf_live`.
+        """
+        return self._formatters["image"]._merge_av_cmaf(
+            video_pieces,
+            request_id,
+            audio=audio,
+            video_segment_seconds=video_segment_seconds,
+            video_duration_s=video_duration_s,
+            created=created,
         )
 
     async def format_video_frames(

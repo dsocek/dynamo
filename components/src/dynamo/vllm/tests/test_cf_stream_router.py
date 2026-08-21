@@ -358,9 +358,10 @@ async def test_cmaf_opt_in_streams_live_segments():
     pieces = [{"cmaf": "metadata"}, {"cmaf": "init"}, {"cmaf": "segment"}]
     seen = {}
 
-    def fake_live(frame_chunks, request_id, *, fps):
+    def fake_live(frame_chunks, request_id, *, fps, audio=None, video_duration_s=None):
         seen["chunks"] = frame_chunks
         seen["fps"] = fps
+        seen["video_duration_s"] = video_duration_s
 
         async def _gen():
             for p in pieces:
@@ -369,7 +370,10 @@ async def test_cmaf_opt_in_streams_live_segments():
         return _gen()
 
     formatter = MagicMock()
+    # Either live path, since whether the A/V one is taken depends on an audio
+    # file being resolvable on the host -- which is not what this test is about.
     formatter.stream_video_cmaf_live = fake_live
+    formatter.stream_av_cmaf_live = fake_live
     router = _router(_rollout(2), _decoder(), formatter, _frame_connector())
 
     chunks = [c async for c in router.generate(_cf_request(cmaf=True), None)]
@@ -440,7 +444,7 @@ async def test_a_missing_router_connector_ref_is_an_error():
 async def test_the_producers_are_cancelled_when_the_consumer_stops_early():
     """A client disconnect leaves both producers blocked on a handoff nobody will drain
     again -- a leaked task per abandoned request."""
-    def fake_live(frame_chunks, request_id, *, fps):
+    def fake_live(frame_chunks, request_id, *, fps, audio=None, video_duration_s=None):
         async def _gen():
             yield {"cmaf": "init"}
             yield {"cmaf": "segment"}
@@ -449,6 +453,7 @@ async def test_the_producers_are_cancelled_when_the_consumer_stops_early():
 
     formatter = MagicMock()
     formatter.stream_video_cmaf_live = fake_live
+    formatter.stream_av_cmaf_live = fake_live
     router = _router(_rollout(50), _decoder(), formatter, _frame_connector())
 
     gen = router.generate(_cf_request(cmaf=True), None)

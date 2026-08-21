@@ -20,25 +20,25 @@ from dynamo.common.utils.output_modalities import (
     get_output_modalities,
     parse_request_type,
 )
-from dynamo.common.utils.video_utils import StreamingCmafEncoder
+from dynamo.common.utils.video_utils import StreamingCmafEncoder, compute_num_frames
 from dynamo.llm import ModelInput, WorkerType, register_model
 from dynamo.runtime import DistributedRuntime
 from dynamo.vllm.main import setup_metrics_collection
 from dynamo.vllm.omni.args import OmniConfig
 from dynamo.vllm.omni.cf_pipeline import FrameQueue, Relay, cf_put_key
-from dynamo.vllm.omni.cf_session import has_cf_session
+from dynamo.vllm.omni.cf_session import (
+    CFSessionRequestError,
+    has_cf_session,
+    parse_cf_session,
+)
 from dynamo.vllm.omni.cmaf_video import (
     CMAF_ANNOTATION,
     CMAF_FALLBACK_VIDEO_CODEC,
-    CMAF_INIT_TAG,
-    CMAF_METADATA_TAG,
-    CMAF_SEGMENT_PREFIX,
     cmaf_gop_frames,
-    cmaf_segment_seconds,
-    metadata_bytes,
+    resolve_cmaf_audio_file,
 )
 from dynamo.vllm.omni.connectors import register_dynamoomni_nixl_connector
-from dynamo.vllm.omni.output_formatter import OutputFormatter
+from dynamo.vllm.omni.output_formatter import AudioTrack, OutputFormatter
 from dynamo.vllm.omni.stage_worker import (
     _connector_key,
     _ensure_stage_connectors,
@@ -57,6 +57,13 @@ from dynamo.vllm.omni.utils import (
 from dynamo.vllm.omni.video_convert import decoded_chunk_to_canonical, to_canonical
 
 logger = logging.getLogger(__name__)
+
+# Fallback audio length for a session (Causal-Forcing) scene that did not state
+# `latents`, leaving its clip length known only to the rollout. An upper bound,
+# not an estimate: the encoder is lazy so unpulled seconds are never produced,
+# and the A/V merge cuts audio at the video's end -- whereas asking for too
+# little would end the audio track early, which stalls playback in MSE.
+_CF_AUDIO_UPPER_BOUND_S = 3600.0
 
 
 class OmniStageRouter:
@@ -354,52 +361,29 @@ class OmniStageRouter:
         # --- Stage 1 (VAE): consume the live pixel-chunk stream. ---
         fps = int((request.get("nvext") or {}).get("fps") or self.config.default_video_fps)
         vae_request = dit_output.to_next_stage_request(request_id)
-        created = int(time.time())
         t_vae = time.monotonic()
-        pixel_chunks_seen = 0
-        enc: StreamingCmafEncoder | None = None
-        metadata_sent = False
-        seg_index = 0
 
-        # _cmaf_chunk lives on the DiffusionFormatter ("image"), not the
-        # dispatcher OutputFormatter; reach it the same way stream_video_cmaf does.
-        diffusion_formatter = self._formatter._formatters["image"]
+        async def _video_pieces() -> AsyncGenerator[tuple[str, bytes, str], None]:
+            """The VAE pixel stream as pull-based CMAF video pieces.
 
-        async def _emit(kind: str, payload: bytes) -> AsyncGenerator[dict, None]:
-            nonlocal metadata_sent, seg_index
-            if kind == "init":
-                if not metadata_sent:
-                    yield diffusion_formatter._cmaf_chunk(
-                        request_id,
-                        created,
-                        CMAF_METADATA_TAG,
-                        metadata_bytes(
-                            None,
-                            cmaf_segment_seconds(),
-                            (enc.codec_string() if enc else None) or CMAF_FALLBACK_VIDEO_CODEC,
-                        ),
-                        progress=0,
-                    )
-                    metadata_sent = True
-                yield diffusion_formatter._cmaf_chunk(request_id, created, CMAF_INIT_TAG, payload, progress=1)
-            else:
-                yield diffusion_formatter._cmaf_chunk(
-                    request_id,
-                    created,
-                    f"{CMAF_SEGMENT_PREFIX}{seg_index}",
-                    payload,
-                    progress=min(99, 2 + seg_index),
-                )
-                seg_index += 1
+            An async generator, so it advances only when the merge below asks for
+            the next piece -- which is what lets audio be interleaved against it.
+            The pull reaches all the way back to ``round_robin``, so back-pressure
+            is unchanged from the push-based version this replaces.
 
-        try:
+            Errors are raised rather than turned into router error dicts: by the
+            time one can happen the client already holds init and some segments,
+            and the merge reports that as a CMAF failure frame -- a partial asset
+            declared partial, instead of a stream that just stops.
+            """
+            pixel_chunks_seen = 0
+            enc: StreamingCmafEncoder | None = None
             async for chunk in await vae_client.round_robin(vae_request):
                 data = chunk.data()
                 if isinstance(data, (str, bytes)):
                     data = json.loads(data)
                 if data.get("error"):
-                    yield {"error": data["error"], "finished": True}
-                    return
+                    raise RuntimeError(f"VAE stage: {data['error']}")
                 # Terminal sentinel: no pixels — the tail is drained by finish().
                 if data.get("finished") and data.get("shm_meta") is None:
                     break
@@ -421,21 +405,108 @@ class OmniStageRouter:
                     enc = StreamingCmafEncoder(fps, width, height, gop_frames=cmaf_gop_frames())
                     await enc.start()
                 async for kind, payload in enc.push(canonical):
-                    async for item in _emit(kind, payload):
-                        yield item
+                    yield (kind, payload, enc.codec_string() or CMAF_FALLBACK_VIDEO_CODEC)
 
             if enc is not None:
                 async for kind, payload in enc.finish():
-                    async for item in _emit(kind, payload):
-                        yield item
-        except Exception as e:
-            logger.error("Router: CMAF live stream failed for %s: %s", request_id, e, exc_info=True)
-            yield {"error": f"CMAF live stream failed: {e}", "finished": True}
-            return
+                    yield (kind, payload, enc.codec_string() or CMAF_FALLBACK_VIDEO_CODEC)
+
+        # One emit path whether or not there is audio: an audio-less request is a
+        # request whose AudioTrack is disabled (source None), which the merge
+        # reports honestly as `has_audio: false` and then never polls.
+        # Segment cadence here is the encoder GOP, not DYN_CMAF_SEGMENT_SECONDS:
+        # this path fragments every `cmaf_gop_frames()` frames (0.25s at 4 @ 16fps),
+        # so that -- not the 2s the fragment-generator path uses -- is what the
+        # audio watermark has to be measured against.
+        async for item in self._formatter.merge_av_cmaf(
+            _video_pieces(),
+            request_id,
+            audio=self._audio_track(request, fps),
+            video_segment_seconds=cmaf_gop_frames() / max(1, fps),
+            video_duration_s=self._video_duration_s(request, fps),
+        ):
+            yield item
         # Natural end: the Rust route emits the DONE(0x05) frame when this
         # generator closes (§9). request_type is accepted for symmetry with the
         # batch path; the CMAF wire contract is modality-fixed.
         _ = request_type
+
+    def _audio_track(
+        self,
+        request: dict,
+        fps: int,
+        *,
+        duration_s: float | None = None,
+        start_s: float = 0.0,
+    ) -> AudioTrack:
+        """Build the request's audio track, disabled when no source is configured.
+
+        POC sourcing: a file on the *router host* (``CF_POC_AUDIO_FILE``, else the
+        example's bundled mp3), stood up here rather than in a worker so the shape
+        downstream -- a lazy fragment generator merged against video -- is already
+        the one a real audio worker will plug into.
+
+        Duration is slaved to the video's. ``duration_s`` overrides the value
+        derived from the request, for a caller that cannot know the clip length up
+        front; over-asking is free, because the encoder is lazy and the merge cuts
+        audio at the video's real end. Under-asking is not: the audio track would
+        end early and MSE stalls playback wherever an active track runs dry.
+
+        ``start_s`` is where in the source to begin, so a chained scene continues
+        the bed instead of restarting it. See ``cf_scene.audio_offset``.
+        """
+        if duration_s is None:
+            duration_s = self._video_duration_s(request, fps)
+        return AudioTrack(resolve_cmaf_audio_file(), duration_s, start_s=start_s)
+
+    def _cf_audio_bounds(
+        self, request: dict, fps: int
+    ) -> tuple[float | None, float]:
+        """``(scene_duration_s, audio_start_s)`` for a session request.
+
+        The duration is None when the scene did not state ``latents``, meaning
+        only the pipeline's default knows the length and the caller has to fall
+        back to an upper bound.
+
+        The offset is how far into the bed this scene starts, which is what makes
+        a storyboard sound like one continuous piece of music rather than the same
+        few seconds restarted per scene. The client is the component that knows
+        it, since it owns the presentation timeline; 0 when it did not say.
+
+        Malformed annotations are not this method's problem to report -- the DiT
+        worker parses the same annotations and fails the request properly. Audio
+        degrades to the video-only-ish default instead of turning a render into a
+        traceback from the audio-sizing path.
+        """
+        try:
+            session = parse_cf_session(request.get("nvext"))
+        except CFSessionRequestError as e:
+            logger.warning("Ignoring unparseable cf_scene for audio sizing: %s", e)
+            return None, 0.0
+        if session is None:
+            return None, 0.0
+        num_frames = session.scene.num_frames()
+        duration_s = None if num_frames is None else num_frames / max(1, fps)
+        return duration_s, session.scene.audio_offset or 0.0
+
+    def _video_duration_s(self, request: dict, fps: int) -> float:
+        """The clip's length in seconds, as the request states it.
+
+        One place, because two callers must agree: the audio track is encoded to
+        this length and the A/V merge cuts audio at it. Deriving them separately
+        would let them drift, and the failure mode is silent -- audio a little
+        long is wasted encoding, audio a little short stalls MSE playback.
+        """
+        nvext = request.get("nvext") or {}
+        return (
+            compute_num_frames(
+                num_frames=nvext.get("num_frames"),
+                seconds=nvext.get("seconds"),
+                fps=nvext.get("fps"),
+                default_fps=self.config.default_video_fps,
+            )
+            / max(1, fps)
+        )
     # -- Causal-Forcing pipelined streaming ---------------------------------
 
     async def _generate_cf_stream(
@@ -534,9 +605,37 @@ class OmniStageRouter:
                 # The live formatter reports its own failures as a CMAF failure
                 # frame, because by then the client already holds a partial asset
                 # and needs to be told it is partial rather than complete.
-                async for chunk in self._formatter.stream_video_cmaf_live(
-                    frames, request_id, fps=fps
-                ):
+                # Scene length and audio offset, when the scene stated them.
+                # `latents` gives the exact frame count (see
+                # CFSceneRequest.num_frames), so this is not an estimate; only a
+                # scene that omitted it falls back to the upper bound, which the
+                # merge then cuts at the video's nominal end.
+                scene_duration_s, audio_start_s = self._cf_audio_bounds(
+                    request, fps
+                )
+                audio = self._audio_track(
+                    request,
+                    fps,
+                    duration_s=(
+                        _CF_AUDIO_UPPER_BOUND_S
+                        if scene_duration_s is None
+                        else scene_duration_s
+                    ),
+                    start_s=audio_start_s,
+                )
+                if audio.enabled:
+                    stream = self._formatter.stream_av_cmaf_live(
+                        frames,
+                        request_id,
+                        fps=fps,
+                        audio=audio,
+                        video_duration_s=scene_duration_s,
+                    )
+                else:
+                    stream = self._formatter.stream_video_cmaf_live(
+                        frames, request_id, fps=fps
+                    )
+                async for chunk in stream:
                     yield chunk
             else:
                 # No CMAF opt-in: collect the stream and answer as one clip. The

@@ -8,6 +8,7 @@ video frames to MP4 format.
 """
 
 import asyncio
+import functools
 import io
 import logging
 import os
@@ -16,6 +17,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from typing import AsyncIterator, Optional, Tuple
 
 import numpy as np
@@ -27,6 +29,21 @@ DEFAULT_VIDEO_WIDTH = 832
 DEFAULT_VIDEO_HEIGHT = 480
 DEFAULT_VIDEO_FPS = 16
 DEFAULT_VIDEO_NUM_FRAMES = 97
+
+# Audio track defaults (see encode_audio_fragments).
+DEFAULT_AUDIO_SAMPLE_RATE = 48000
+DEFAULT_AUDIO_CHANNELS = 2
+DEFAULT_AUDIO_BITRATE = "128k"
+DEFAULT_AUDIO_FRAG_SECONDS = 0.5
+
+# RFC 6381 codec strings for the audio track. Unlike H.264 -- whose profile and
+# level have to be read back out of the encoded init segment -- these are fixed
+# by the codec choice, so no parsing is needed to advertise them.
+_AUDIO_CODEC_STRINGS = {
+    "aac": "mp4a.40.2",  # AAC-LC
+    "libopus": "opus",
+    "opus": "opus",
+}
 
 
 def parse_size(
@@ -971,6 +988,288 @@ def encode_video_fragments(
             )
     finally:
         # A consumer that stops early (client disconnect) must not leak ffmpeg.
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+
+
+def audio_codec_string(codec: str) -> str:
+    """RFC 6381 codec string for an audio codec name, for the MSE MIME type.
+
+    Raises:
+        ValueError: On a codec with no known mapping -- guessing here would
+            surface as a silent ``addSourceBuffer`` rejection in the browser,
+            which is far harder to diagnose than a startup error.
+    """
+    try:
+        return _AUDIO_CODEC_STRINGS[codec.lower()]
+    except KeyError:
+        raise ValueError(
+            f"No RFC 6381 codec string known for audio codec {codec!r}; "
+            f"known: {sorted(_AUDIO_CODEC_STRINGS)}"
+        ) from None
+
+
+def _fmp4_pieces(buffers):
+    """Group a stream of byte buffers into fMP4 init and media-segment pieces.
+
+    Container-level only, so it works for any codec: accumulates ``ftyp``/``moov``
+    into one init piece, then pairs each ``moof`` with the data box that follows
+    it into a media segment. Trailing index/padding boxes (``sidx``, ``mfra``,
+    ``free``) are dropped -- MSE ignores them and appending them only confuses a
+    SourceBuffer.
+
+    Args:
+        buffers: Iterable of byte runs, in order, as read from the muxer.
+
+    Yields:
+        ``("init", bytes)`` once, then ``("segment", bytes)`` per fragment.
+    """
+    pending = b""
+    init_parts: list[bytes] = []
+    init_done = False
+    moof: bytes | None = None
+    for buf in buffers:
+        pending += buf
+        boxes, pending = iter_fragmented_mp4_boxes(pending)
+        for btype, raw in boxes:
+            if not init_done:
+                init_parts.append(raw)
+                if btype == b"moov":
+                    init_done = True
+                    yield ("init", b"".join(init_parts))
+                continue
+            if btype == b"moof":
+                moof = raw
+                continue
+            if moof is not None:
+                yield ("segment", moof + raw)
+                moof = None
+
+
+@functools.lru_cache(maxsize=16)
+def audio_source_duration_s(source: str) -> Optional[float]:
+    """Length of an audio file in seconds, or None when it cannot be determined.
+
+    Cached, because it is asked once per clip for the same handful of files and
+    the answer cannot change without the file changing.
+
+    None rather than an exception on any failure -- no ffprobe, an unreadable
+    file, an unparseable answer. The one caller uses this to *improve* an offset
+    it already has, so not knowing has to be survivable.
+    """
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        out = subprocess.run(
+            [
+                ffprobe, "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                source,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=True,
+        )
+        duration = float(out.stdout.decode("utf-8", errors="replace").strip())
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        logger.warning("Could not probe the duration of %s: %s", source, e)
+        return None
+    return duration if duration > 0 else None
+
+
+def _wrap_audio_start(source: str, start_s: float) -> float:
+    """Fold an offset back into the source's length, so it always lands inside it.
+
+    A caller stitching a continuous bed out of one file passes an ever-growing
+    offset, and a long enough session eventually walks off the end. Seeking past
+    EOF yields *no samples at all* -- not even ``apad`` silence, since there is no
+    frame to pad after -- so the audio track would simply be empty, and in MSE an
+    active track with no data at ``currentTime`` stalls playback outright. Wrapping
+    restarts the bed instead, which is merely audible.
+
+    A clip straddling the wrap point gets the file's tail plus ``apad`` silence
+    rather than a seam, once per full pass through the source. Left as is: the fix
+    is two concatenated reads, and this is a POC bed, not a mix.
+    """
+    if start_s <= 0:
+        return start_s
+    duration = audio_source_duration_s(source)
+    if duration is None or start_s < duration:
+        return start_s
+    wrapped = start_s % duration
+    logger.info(
+        "Audio offset %.3fs is past the end of %s (%.3fs); wrapping to %.3fs",
+        start_s, source, duration, wrapped,
+    )
+    return wrapped
+
+
+def encode_audio_fragments(
+    source: str,
+    duration_s: float,
+    *,
+    codec: str = "aac",
+    bitrate: str = DEFAULT_AUDIO_BITRATE,
+    sample_rate: int = DEFAULT_AUDIO_SAMPLE_RATE,
+    channels: int = DEFAULT_AUDIO_CHANNELS,
+    frag_seconds: float = DEFAULT_AUDIO_FRAG_SECONDS,
+    delay_s: float = 0.0,
+    start_s: float = 0.0,
+):
+    """Transcode an audio file into fMP4 fragments, yielding them as they emerge.
+
+    The audio counterpart to :func:`encode_video_fragments`, and deliberately the
+    same protocol so the caller can merge the two streams without special-casing
+    either. Materially simpler than its video sibling in one respect: there is no
+    raw input to write, so stdin is unused and the write/read deadlock that forces
+    three threads there cannot occur here.
+
+    **Lazy.** As a generator, nothing runs -- no ffmpeg -- until the first
+    ``next()``. That is load-bearing: it lets the consumer's pacing decide when
+    audio is produced rather than having a subprocess race ahead on its own.
+
+    Args:
+        source: Path to any ffmpeg-readable audio file.
+        duration_s: Output length. The source is trimmed to it, and ``apad``
+            pads with silence if the source is shorter, so the result is exactly
+            this long either way.
+        codec / bitrate / sample_rate / channels: Encoder settings. AAC-LC is the
+            default because AAC-in-fMP4 is the one combination every MSE
+            implementation supports.
+        frag_seconds: Target fragment duration. Approximate by nature: the muxer
+            cuts on codec frame boundaries, and an AAC-LC frame is 1024 samples
+            (21.33 ms at 48 kHz), so 0.5 s becomes ~0.512 s. Callers must not
+            assume fragment *k* lines up with anything.
+        delay_s: Artificial per-fragment delay, for standing in for a generator
+            that is slower than realtime. Applies to media fragments only, never
+            the init. Note this throttles *delivery*, not encoding -- ffmpeg still
+            runs ahead into the OS pipe -- which is the right model for a
+            downstream consumer that receives slowly.
+        start_s: Where in the source to start reading, so a caller stitching
+            several clips out of one file can continue rather than restart. The
+            *output* still begins at timestamp 0, which is what a consumer that
+            positions the result itself (MSE ``timestampOffset``) needs. An offset
+            past the end of the source is wrapped back into it rather than
+            producing an empty track -- see :func:`_wrap_audio_start`.
+
+    Yields:
+        ``("init", bytes)`` once, then ``("segment", bytes)`` per fragment.
+
+    Raises:
+        RuntimeError: If ffmpeg is missing, exits nonzero, or produces no init.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found in PATH; required for audio encoding")
+    if duration_s <= 0:
+        raise ValueError(f"duration_s must be positive; got {duration_s}")
+    if start_s < 0:
+        raise ValueError(f"start_s must not be negative; got {start_s}")
+
+    codec_string = audio_codec_string(codec)
+    frag_us = max(1, int(max(0.05, float(frag_seconds)) * 1_000_000))
+    start_s = _wrap_audio_start(source, start_s)
+
+    cmd = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+        # -ss *before* -i, which matters twice over: it seeks instead of decoding
+        # and discarding everything up to the offset, and it rebases the output
+        # timestamps to 0. An output-side -ss can carry the source position into
+        # the fragments' tfdt, which a consumer that also applies its own offset
+        # would then count twice.
+        *(["-ss", f"{start_s:.6f}"] if start_s > 0 else []),
+        "-i", source,
+        # An explicit audio map plus -vn: many mp3s carry cover art as a video
+        # stream, and letting it through would add a second track to the init
+        # segment that the client never asked for and cannot render.
+        "-map", "0:a:0", "-vn",
+        "-af", "apad",
+        "-t", f"{duration_s:.6f}",
+        "-c:a", codec, "-b:a", bitrate,
+        "-ar", str(sample_rate), "-ac", str(channels),
+        # No +frag_keyframe here, unlike video: every audio sample is a sync
+        # sample, so keyframe-cutting would fragment per codec frame (~21 ms).
+        # Fragment length has to be stated as a duration instead.
+        "-movflags", "+empty_moov+default_base_moof",
+        "-frag_duration", str(frag_us),
+        # Push each fragment out of ffmpeg's own buffer as it is written, the
+        # same as the persistent video encoder does. Without it a fragment can
+        # sit in stdio until the next few join it.
+        "-flush_packets", "1",
+        "-f", "mp4", "pipe:1",
+    ]
+
+    logger.info(
+        "Streaming-encoding audio %s: %.3fs from +%.3fs via %s (%s), frag=%dus%s",
+        source, duration_s, start_s, codec, codec_string, frag_us,
+        f", delay={delay_s:.3f}s/fragment" if delay_s > 0 else "",
+    )
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    err_chunks: list[bytes] = []
+    err_reader = threading.Thread(
+        target=lambda: err_chunks.append(proc.stderr.read()), daemon=True
+    )
+    err_reader.start()
+
+    def _stderr_text() -> str:
+        return b"".join(err_chunks).decode("utf-8", errors="replace").strip()
+
+    def _read_stdout():
+        while True:
+            # read1, not read: read() on a BufferedReader blocks until the full
+            # request is satisfied, and an AAC fragment is only a few KB -- so a
+            # 64 KB read would hold ~8 fragments hostage and deliver them in a
+            # burst, defeating the pacing this generator exists to allow.
+            buf = proc.stdout.read1(65536)
+            if not buf:
+                return
+            yield buf
+
+    init_done = False
+    emitted = 0
+    try:
+        for kind, payload in _fmp4_pieces(_read_stdout()):
+            if kind == "init":
+                init_done = True
+                yield ("init", payload)
+                continue
+            if delay_s > 0:
+                time.sleep(delay_s)
+            emitted += 1
+            yield ("segment", payload)
+
+        proc.wait(timeout=60)
+        err_reader.join(timeout=5)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg audio encode of {source!r} failed "
+                f"(exit {proc.returncode}): {_stderr_text()}"
+            )
+        if not init_done:
+            raise RuntimeError(
+                f"audio encode of {source!r} produced no init segment (no moov "
+                f"box); ffmpeg said: {_stderr_text()!r}"
+            )
+        logger.info(
+            "Audio encode of %s complete: %d fragment(s)", source, emitted
+        )
+    finally:
+        # A consumer that stops early -- client disconnect, or the video track
+        # ending first -- must not leak ffmpeg.
         if proc.poll() is None:
             proc.kill()
             try:

@@ -28,10 +28,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 
 import numpy as np
 
 from dynamo.common.utils.video_utils import (
+    DEFAULT_AUDIO_FRAG_SECONDS,
+    audio_codec_string,
+    encode_audio_fragments,
     encode_video,
     encode_video_fragments,
     h264_codec_string_from_init,
@@ -48,6 +52,20 @@ CMAF_METADATA_TAG = "cmaf:metadata"
 CMAF_INIT_TAG = "cmaf:init"
 CMAF_SEGMENT_PREFIX = "cmaf:segment:"
 
+# Audio is a *second, independent* CMAF track, not muxed into the video one: in
+# fMP4 each track is fragmented separately, so nothing has to align, and the
+# muxer never has to hold a video fragment back waiting for audio.
+CMAF_AUDIO_INIT_TAG = "cmaf:audio:init"
+CMAF_AUDIO_SEGMENT_PREFIX = "cmaf:audio:segment:"
+# A non-fatal audio failure. Distinct from a failed NvVideosResponse, which
+# aborts the whole stream at the frontend: when only audio dies the video is
+# still good, so this rides through as an ordinary payload item.
+CMAF_AUDIO_ERROR_TAG = "cmaf:audio:error"
+
+# Audio codec for the second track. AAC-LC because AAC-in-fMP4 is the one
+# combination every MSE implementation supports; Opus-in-MP4 is spottier.
+CMAF_AUDIO_CODEC = "aac"
+
 # ``segment_count`` value advertised when the total is not yet known because
 # segments are still being produced. 0 is used rather than null so the field
 # stays a number for clients that predate open-ended streams; they will simply
@@ -61,6 +79,9 @@ CMAF_FALLBACK_VIDEO_CODEC = "avc1.4d401f"
 _DEFAULT_SEGMENT_SECONDS = 2
 _DEFAULT_EMIT_CADENCE_MS = 0
 _DEFAULT_GOP_FRAMES = 4
+# One audio fragment: the smallest lead that keeps audio from being the track
+# that starves. See cmaf_audio_lead_seconds().
+_DEFAULT_AUDIO_LEAD_SECONDS = DEFAULT_AUDIO_FRAG_SECONDS
 
 
 def has_cmaf_annotation(nvext) -> bool:
@@ -129,13 +150,119 @@ def cmaf_gop_frames() -> int:
     return max(1, value)
 
 
+def cmaf_audio_frag_seconds() -> float:
+    """Target audio fragment duration (env: ``DYN_CMAF_AUDIO_FRAG_SECONDS``).
+
+    Approximate by nature -- the muxer cuts on codec frame boundaries -- so this
+    is a request, not a guarantee. Nothing may depend on it being exact.
+    """
+    raw = os.environ.get("DYN_CMAF_AUDIO_FRAG_SECONDS")
+    if not raw:
+        return DEFAULT_AUDIO_FRAG_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid DYN_CMAF_AUDIO_FRAG_SECONDS=%r; using %.3f",
+            raw,
+            DEFAULT_AUDIO_FRAG_SECONDS,
+        )
+        return DEFAULT_AUDIO_FRAG_SECONDS
+    return max(0.05, value)
+
+
+def cmaf_audio_delay_s() -> float:
+    """Artificial per-fragment audio delay (env: ``DYN_CMAF_AUDIO_DELAY_MS``).
+
+    Stands in for an audio generator that is slower than realtime. A file source
+    outruns realtime by orders of magnitude, so without this the "audio lags
+    behind video" case -- the one that stalls MSE playback, and the one a real
+    audio worker will actually produce -- is unreachable in testing.
+
+    Defaults to 0: no delay, audio paced only by the caller's watermark.
+    """
+    raw = os.environ.get("DYN_CMAF_AUDIO_DELAY_MS")
+    if not raw:
+        return 0.0
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid DYN_CMAF_AUDIO_DELAY_MS=%r; using 0", raw)
+        return 0.0
+    return max(0, value) / 1000.0
+
+
+def cmaf_audio_lead_seconds() -> float:
+    """How far audio may run ahead of video on the wire (env: ``DYN_CMAF_AUDIO_LEAD_SECONDS``).
+
+    A lead exists because of an asymmetry in MSE: playback stalls if *any* active
+    ``SourceBuffer`` lacks data at ``currentTime``, so audio starving is as fatal
+    as video starving while being far cheaper to prevent. Keeping audio slightly
+    ahead makes video the only track that can ever be the bottleneck.
+    """
+    raw = os.environ.get("DYN_CMAF_AUDIO_LEAD_SECONDS")
+    if not raw:
+        return _DEFAULT_AUDIO_LEAD_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid DYN_CMAF_AUDIO_LEAD_SECONDS=%r; using %.3f",
+            raw,
+            _DEFAULT_AUDIO_LEAD_SECONDS,
+        )
+        return _DEFAULT_AUDIO_LEAD_SECONDS
+    return max(0.0, value)
+
+
+def resolve_cmaf_audio_file() -> str | None:
+    """Locate the POC audio bed, or return None to stream video-only.
+
+    Resolution order: ``CF_POC_AUDIO_FILE`` if set, else the example's bundled
+    mp3 if it happens to be present. Returning None rather than raising is the
+    whole enablement rule -- audio is added when a file can be found and silently
+    skipped when it cannot, so no client-facing opt-in is needed for the POC.
+
+    Note this is a read on the **router host**, unlike the example's client-side
+    music bed which the proxy serves over HTTP.
+    """
+    override = os.environ.get("CF_POC_AUDIO_FILE")
+    if override:
+        if Path(override).is_file():
+            return override
+        # Explicitly asked for and missing is worth a complaint; the default
+        # simply not being there is not.
+        logger.warning(
+            "CF_POC_AUDIO_FILE=%r is not a readable file; streaming video-only",
+            override,
+        )
+        return None
+
+    default = (
+        Path(__file__).resolve().parents[5]
+        / "examples"
+        / "custom_backend"
+        / "cmaf_binary_video_streaming"
+        / "underwater_theme.mp3"
+    )
+    return str(default) if default.is_file() else None
+
+
 def source_buffer_mime_type(video_codec: str) -> str:
     """MSE ``SourceBuffer`` mime type for the packaged video-only asset."""
     return f'video/mp4; codecs="{video_codec}"'
 
 
+def audio_source_buffer_mime_type(audio_codec: str) -> str:
+    """MSE ``SourceBuffer`` mime type for the separate audio track."""
+    return f'audio/mp4; codecs="{audio_codec}"'
+
+
 def metadata_bytes(
-    segment_count: int | None, target_duration_seconds: int, video_codec: str
+    segment_count: int | None,
+    target_duration_seconds: int,
+    video_codec: str,
+    audio_codec: str | None = None,
 ) -> bytes:
     """Serialize the ``cmaf:metadata`` payload (JSON, UTF-8).
 
@@ -145,14 +272,22 @@ def metadata_bytes(
     a count -- see :data:`CMAF_OPEN_ENDED`. Both live paths pass ``None``: the
     persistent-ffmpeg encoder and the fragment generator alike learn the total
     only when the stream ends.
+
+    ``audio_codec`` set means a second, independent audio track will follow on the
+    same wire. It must be decided *before* this frame is sent and not revised
+    afterwards: the client creates both ``SourceBuffer``s from this payload, and
+    browsers are unreliable about adding one later, once the first holds data.
     """
     payload = {
         "protocol": CMAF_PROTOCOL,
         "mime_type": "video/mp4",
         "source_buffer_mime_type": source_buffer_mime_type(video_codec),
         "video_codec": video_codec,
-        "audio_codec": None,
-        "has_audio": False,
+        "audio_codec": audio_codec,
+        "audio_source_buffer_mime_type": (
+            audio_source_buffer_mime_type(audio_codec) if audio_codec else None
+        ),
+        "has_audio": audio_codec is not None,
         "target_duration_seconds": target_duration_seconds,
         # Kept for clients written against the fixed-count metadata. 0 rather
         # than null because the field is typed as a number there; a client that
@@ -161,6 +296,21 @@ def metadata_bytes(
         "open_ended": segment_count is None,
     }
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def audio_error_bytes(message: str) -> bytes:
+    """Serialize the ``cmaf:audio:error`` payload (JSON, UTF-8).
+
+    Same ``{"error": ...}`` envelope the frontend uses for its own error frames,
+    so a client needs one handler for both, plus a ``track`` field naming the
+    casualty. The field is load-bearing: both errors arrive as wire kind
+    ``0x04``, and a client that cannot tell them apart cannot know to drop the
+    audio ``SourceBuffer`` -- which it must, or playback stalls at the point
+    audio stopped even though the video track is complete.
+    """
+    return json.dumps(
+        {"error": message, "track": "audio"}, separators=(",", ":")
+    ).encode("utf-8")
 
 
 def package_frames_to_cmaf(
@@ -262,6 +412,60 @@ def stream_frames_to_cmaf(
             codec = h264_codec_string_from_init(payload) or CMAF_FALLBACK_VIDEO_CODEC
             logger.info(
                 "CMAF stream opened: init (%d bytes), codec=%s", len(payload), codec
+            )
+            yield ("init", payload, codec)
+        else:
+            yield ("segment", payload, index)
+            index += 1
+
+
+def stream_audio_file_to_cmaf(
+    source: str,
+    duration_s: float,
+    *,
+    frag_seconds: float | None = None,
+    delay_s: float | None = None,
+    start_s: float = 0.0,
+):
+    """:func:`stream_frames_to_cmaf` for the audio track: same tuple protocol.
+
+    Deliberately the same ``(kind, payload, extra)`` shape as the video generator
+    so a caller merging the two tracks needs no per-track special-casing beyond
+    which tag it stamps on the result.
+
+    Lazy, like its video sibling: ffmpeg does not start until the first ``next()``,
+    which is what lets the consumer's pacing decide when audio is produced.
+
+    Args:
+        source: Path to an ffmpeg-readable audio file, on this host.
+        duration_s: Output length; the track is trimmed or silence-padded to it.
+        frag_seconds / delay_s: Default to the env-configured values.
+        start_s: Offset into the source to start from. A chained-scene client gets
+            a continuous bed across requests by passing the timeline position it
+            has already consumed; the fragments still start at timestamp 0, so
+            positioning them stays the consumer's job.
+
+    Yields:
+        ``("init", bytes, codec_string)`` once, then ``("segment", bytes, index)``
+        per fragment.
+    """
+    index = 0
+    for kind, payload in encode_audio_fragments(
+        source,
+        duration_s,
+        codec=CMAF_AUDIO_CODEC,
+        frag_seconds=(
+            cmaf_audio_frag_seconds() if frag_seconds is None else frag_seconds
+        ),
+        delay_s=cmaf_audio_delay_s() if delay_s is None else delay_s,
+        start_s=start_s,
+    ):
+        if kind == "init":
+            codec = audio_codec_string(CMAF_AUDIO_CODEC)
+            logger.info(
+                "CMAF audio track opened: init (%d bytes), codec=%s",
+                len(payload),
+                codec,
             )
             yield ("init", payload, codec)
         else:

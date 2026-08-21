@@ -179,15 +179,21 @@ class DemoProxyHandler(http.server.BaseHTTPRequestHandler):
         self._handle()
 
     def _handle(self, head_only: bool = False) -> None:
-        if self.path == "/" or self.path == "/client.html":
+        # Routing decisions use the path alone; `self.path` keeps the query
+        # string because upstream needs it forwarded verbatim. Matching routes
+        # against the raw target made every local route 404 the moment a query
+        # string appeared -- `/?debug=1` is not `/`.
+        route = self._route_path()
+
+        if route == "/" or route == "/client.html":
             self._serve_static(CLIENT_HTML, head_only=head_only)
             return
 
-        if self.path == "/demo/gpu-status":
+        if route == "/demo/gpu-status":
             self._send_json(200, self.server.gpu_gate.status())
             return
 
-        if self.path.startswith("/v1/") or self.path in {
+        if route.startswith("/v1/") or route in {
             "/live",
             "/ready",
             "/health",
@@ -196,12 +202,16 @@ class DemoProxyHandler(http.server.BaseHTTPRequestHandler):
             self._proxy_request(head_only=head_only)
             return
 
-        candidate = self._safe_static_path(self.path)
+        candidate = self._safe_static_path(route)
         if candidate and candidate.is_file():
             self._serve_static(candidate, head_only=head_only)
             return
 
         self.send_error(404, "Not found")
+
+    def _route_path(self) -> str:
+        """The request target with any query string and fragment removed."""
+        return self.path.split("?", 1)[0].split("#", 1)[0]
 
     def _safe_static_path(self, raw_path: str) -> Path | None:
         cleaned = raw_path.split("?", 1)[0].split("#", 1)[0].lstrip("/")
