@@ -174,16 +174,28 @@ async def test_a_one_shot_request_still_takes_the_serial_path():
     assert chunks == [{"data": []}]
 
 
-async def test_a_single_stage_deployment_refuses_a_session_request():
-    """Streaming needs the DiT/VAE split; saying so beats a failure deeper in."""
-    dit = _rollout(1)
-    router = _router(dit, _decoder())
+async def test_a_single_stage_deployment_serves_a_session_request_inline():
+    """The aggregated deploy, which this path used to refuse outright.
+
+    A ``full``-role worker decodes inline and puts finished pixels on its own
+    router edge, so there is no second hop to dispatch: the router collects the
+    blocks the rollout announces instead of asking a VAE stage to decode them.
+    The VAE client going untouched is the assertion that matters -- a single
+    request on it would mean the aggregated path had quietly kept the
+    disaggregated hop and was measuring the wrong topology.
+    """
+    dit, vae = _rollout(2), _decoder()
+    formatter = MagicMock()
+    formatter.format_video_frames = _async_return({"data": [{"url": "x"}]})
+    router = _router(dit, vae, formatter)
+    # One stage, so the final stage is stage 0 and its router edge is (0, "router").
     router.stage_configs = [_stage_cfg(0)]
+    router.connectors = {stage_router._connector_key(0, "router"): _frame_connector()}
 
     chunks = [c async for c in router.generate(_cf_request(), None)]
 
-    assert len(chunks) == 1
-    assert "2-stage" in chunks[0]["error"]
+    assert chunks == [{"data": [{"url": "x"}]}]
+    assert vae.requests == []
 
 
 # -- the pipelining --------------------------------------------------------

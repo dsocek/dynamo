@@ -300,6 +300,12 @@
           <div class="stat" id="appendStat">Appended: 0</div>
           <div class="stat" id="audioStat">Audio: unknown</div>
           <div class="stat" id="sceneStat">Scene: -</div>
+          <!-- ACHIEVED fps: what the system actually sustains end to end. This is
+               NOT the fps input above -- that one is the playback timebase baked
+               into the bitstream, a constant that measures nothing. See
+               resetAchieved() for how it is derived. -->
+          <div class="stat" id="ttffStat">First frame: -</div>
+          <div class="stat" id="fpsStat">Achieved fps: -</div>
         </div>
       </section>
 
@@ -363,6 +369,8 @@
       const appendStat = document.getElementById("appendStat");
       const audioStat = document.getElementById("audioStat");
       const sceneStat = document.getElementById("sceneStat");
+      const ttffStat = document.getElementById("ttffStat");
+      const fpsStat = document.getElementById("fpsStat");
       const browserHint = document.getElementById("browserHint");
       const startBtn = document.getElementById("start");
       const modeSingleBtn = document.getElementById("modeSingle");
@@ -672,6 +680,9 @@
         setStat(appendStat, "Appended: 0");
         setStat(audioStat, "Audio: unknown");
         setStat(sceneStat, "Scene: -");
+        resetAchieved();
+        setStat(ttffStat, "First frame: -");
+        setStat(fpsStat, "Achieved fps: -");
       }
 
       function setQueuedStat() {
@@ -934,6 +945,230 @@
         return merged;
       }
 
+      // --- Achieved end-to-end fps ----------------------------------------
+      // The `fps` input is the playback timebase written into the bitstream: a
+      // constant, so it says nothing about how fast the system ran. What follows
+      // measures what the system actually SUSTAINED, from two ingredients:
+      //
+      //   when  performance.now() at the moment a media fragment finished
+      //         arriving (we are already reading incrementally via getReader()).
+      //   how many  the fragment's own `trun` sample counts.
+      //
+      // Reading frame counts out of the container -- rather than asking a device
+      // API or trusting a requested frame count -- is what makes this work
+      // IDENTICALLY on Intel XPU/VA-API, NVIDIA, and CPU libx264 output. There is
+      // nothing hardware-specific in this measurement.
+      //
+      // Two numbers, and the steady one is the headline:
+      //   ttff        request sent -> first media fragment. Latency: prompt
+      //               encode plus pipeline fill (i.e. the warmup).
+      //   steady fps  frames after the first fragment / span from first to last
+      //               fragment. Excludes ttff, so it is throughput with the
+      //               pipeline full -- the number to quote.
+      //   overall fps all frames / total wall, ttff included. What a viewer
+      //               waiting on the whole clip experiences.
+      let fpsEpoch = null; // performance.now() when the first request went out
+      let firstFragmentAt = null;
+      let lastFragmentAt = null;
+      let framesTotal = 0;
+      let framesAfterFirst = 0;
+      // One entry per request: {start, first, last, frags}. Burst delivery has to
+      // be judged per request, because on a storyboard the seconds between scenes
+      // stretch the whole-run span enough to disguise per-scene clumping (two
+      // 25-latent scenes looked like a plausible 24 fps while every fragment in
+      // each scene still landed inside a second).
+      let fpsRequests = [];
+
+      function resetAchieved() {
+        fpsEpoch = null;
+        firstFragmentAt = null;
+        lastFragmentAt = null;
+        framesTotal = 0;
+        framesAfterFirst = 0;
+        fpsRequests = [];
+      }
+
+      // Called just before each scene's POST goes out.
+      function markRequestStart() {
+        if (fpsEpoch === null) return;
+        fpsRequests.push({
+          start: performance.now() - fpsEpoch,
+          first: null,
+          last: null,
+          frags: 0,
+        });
+      }
+
+      // Walk ISO-BMFF boxes in [start, end). Tolerates a truncated tail by
+      // stopping, and handles the 64-bit (size==1) and to-end (size==0) forms.
+      function* iterBoxes(view, start, end) {
+        let off = start;
+        while (off + 8 <= end) {
+          let size = view.getUint32(off);
+          const type = String.fromCharCode(
+            view.getUint8(off + 4),
+            view.getUint8(off + 5),
+            view.getUint8(off + 6),
+            view.getUint8(off + 7)
+          );
+          let hdr = 8;
+          if (size === 1) {
+            if (off + 16 > end) return;
+            // Only the low 32 bits: a fragment above 4 GiB is not a thing here,
+            // and getUint32 pairs avoid BigInt for no benefit.
+            size = view.getUint32(off + 8) * 2 ** 32 + view.getUint32(off + 12);
+            hdr = 16;
+          } else if (size === 0) {
+            size = end - off;
+          }
+          if (size < hdr || off + size > end) return;
+          yield { off, size, hdr, type };
+          off += size;
+        }
+      }
+
+      // Frames in one fMP4 fragment: moof -> traf -> trun, summing sample_count
+      // (the u32 right after the trun version/flags word). Returns 0 for an init
+      // fragment, which has no trun -- correct, since init carries no media and
+      // must not count toward achieved fps.
+      function countFrames(payload) {
+        const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+        let total = 0;
+        for (const moof of iterBoxes(view, 0, payload.byteLength)) {
+          if (moof.type !== "moof") continue;
+          for (const traf of iterBoxes(view, moof.off + moof.hdr, moof.off + moof.size)) {
+            if (traf.type !== "traf") continue;
+            for (const trun of iterBoxes(view, traf.off + traf.hdr, traf.off + traf.size)) {
+              if (trun.type === "trun") {
+                total += view.getUint32(trun.off + trun.hdr + 4);
+              }
+            }
+          }
+        }
+        return total;
+      }
+
+      function recordFragment(payload) {
+        const frames = countFrames(payload);
+        if (!frames) return 0;
+        const now = performance.now();
+        framesTotal += frames;
+        if (firstFragmentAt === null) {
+          firstFragmentAt = now;
+        } else {
+          framesAfterFirst += frames;
+        }
+        lastFragmentAt = now;
+        const req = fpsRequests[fpsRequests.length - 1];
+        if (req) {
+          const rel = now - fpsEpoch;
+          if (req.first === null) req.first = rel;
+          req.last = rel;
+          req.frags += 1;
+        }
+        updateAchievedStats();
+        return frames;
+      }
+
+      // Shared by the live stat and the end-of-run log so they can never
+      // disagree. Returns null until there is something real to report.
+      //
+      // The burst check is the important part. "Steady" is only a throughput if
+      // fragments actually arrive spread across the request. On the current
+      // stack they do not: the CMAF encoder is fed from a clip the pipeline has
+      // already finished, so all fragments land in a burst at the end (measured
+      // on 2xH200: 4 fragments inside 0.13s after a 6.4s wait -> a nonsense 506
+      // "fps" against a true 14.8). When steady runs more than 3x overall,
+      // overall becomes the headline and steady is labelled as encoder flush.
+      function achievedSummary() {
+        if (fpsEpoch === null || firstFragmentAt === null) return null;
+        const ttff = (firstFragmentAt - fpsEpoch) / 1000;
+        const span = (lastFragmentAt - firstFragmentAt) / 1000;
+        const wall = (lastFragmentAt - fpsEpoch) / 1000;
+        const overall = wall > 0 ? framesTotal / wall : null;
+        const steady = span > 0 && framesAfterFirst > 0 ? framesAfterFirst / span : null;
+        // Bursty when EVERY multi-fragment request delivered its fragments inside
+        // a small fraction of its own duration. If they all clumped, the run's
+        // steady figure is built entirely from flush artifacts.
+        const multi = fpsRequests.filter((r) => r.frags > 1);
+        const bursty = multi.filter((r) => {
+          const rSpan = r.last - r.first;
+          const rWall = r.last - r.start;
+          return rWall > 0 && rSpan <= 0.25 * rWall;
+        });
+        const burst =
+          steady !== null && multi.length > 0 && bursty.length === multi.length;
+        return {
+          ttff,
+          span,
+          wall,
+          overall,
+          steady,
+          burst,
+          headline: burst || steady === null ? overall : steady,
+        };
+      }
+
+      function updateAchievedStats() {
+        const s = achievedSummary();
+        if (!s) return;
+        setStat(ttffStat, `First frame: ${s.ttff.toFixed(2)}s`);
+        if (s.overall === null) {
+          setStat(fpsStat, `Achieved fps: measuring (${framesTotal} frames)`);
+        } else if (s.burst) {
+          setStat(
+            fpsStat,
+            `Achieved fps: ${s.overall.toFixed(1)} (${framesTotal} frames, bursty delivery)`
+          );
+        } else if (s.steady !== null) {
+          setStat(
+            fpsStat,
+            `Achieved fps: ${s.steady.toFixed(1)} steady / ${s.overall.toFixed(1)} overall ` +
+              `(${framesTotal} frames)`
+          );
+        } else {
+          setStat(fpsStat, `Achieved fps: ${s.overall.toFixed(1)} (${framesTotal} frames)`);
+        }
+      }
+
+      function logAchievedSummary() {
+        const s = achievedSummary();
+        if (!s) {
+          appendLog("No media fragments arrived -- no achieved fps to report.");
+          return;
+        }
+        let lines =
+          `Achieved end-to-end rate (measured, not the bitstream fps field):\n` +
+          `  time to first frame:    ${s.ttff.toFixed(2)}s (prompt encode + pipeline fill)\n`;
+        if (s.burst) {
+          lines +=
+            `  ACHIEVED fps:           ${s.overall.toFixed(2)}   <- e2e throughput ` +
+            `(${framesTotal} frames / ${s.wall.toFixed(2)}s)\n` +
+            `  NOTE: delivery was BURSTY -- every fragment arrived within ` +
+            `${s.span.toFixed(2)}s at the end of a ${s.wall.toFixed(2)}s request.\n` +
+            `  The post-first-frame rate (${s.steady.toFixed(0)} fps, ` +
+            `${(s.steady / s.overall).toFixed(0)}x overall) is the ENCODER flushing a\n` +
+            `  clip the pipeline had already finished -- not frames being produced. ` +
+            `Overall is the honest number here.\n`;
+        } else if (s.steady !== null) {
+          lines +=
+            `  ACHIEVED fps (steady):  ${s.steady.toFixed(2)}   <- e2e throughput, ` +
+            `pipeline full (${framesAfterFirst} frames / ${s.span.toFixed(2)}s)\n` +
+            `  achieved fps (overall): ${s.overall.toFixed(2)}   ` +
+            `(${framesTotal} frames / ${s.wall.toFixed(2)}s, ttff included)\n`;
+        } else {
+          lines +=
+            `  ACHIEVED fps (steady):  n/a (needs more than one media fragment)\n` +
+            `  achieved fps (overall): ${s.overall.toFixed(2)}   ` +
+            `(${framesTotal} frames / ${s.wall.toFixed(2)}s, ttff included)\n`;
+        }
+        appendLog(
+          lines +
+            `  Frame counts come from the fragments' own trun boxes, so this ` +
+            `number is measured the same way on XPU and NVIDIA.`
+        );
+      }
+
       function drainFrames(chunk) {
         frameBuffer = concatUint8Arrays(frameBuffer, chunk);
         while (frameBuffer.length >= 5) {
@@ -966,14 +1201,21 @@
           case FRAME_KIND.INIT:
             queueInit(videoTrack, payload);
             break;
-          case FRAME_KIND.SEGMENT:
-            appendLog(`Received media fragment (${payload.length} bytes)`);
+          case FRAME_KIND.SEGMENT: {
+            // Timestamp it BEFORE queueing: queueAppend hands the bytes to the
+            // SourceBuffer, whose append latency is a playback concern and has
+            // nothing to do with how fast the system produced the frames.
+            const frames = recordFragment(payload);
+            appendLog(
+              `Received media fragment (${payload.length} bytes, ${frames} frames)`
+            );
             queueAppend(videoTrack, payload);
             break;
+          }
           case FRAME_KIND.AUDIO_INIT:
             queueInit(audioTrack, payload);
             break;
-          case FRAME_KIND.AUDIO_SEGMENT:
+          case FRAME_KIND.AUDIO_SEGMENT: {
             if (!audioTrack.expected) {
               // Unusable mime type, or already dropped. Discarding beats
               // buffering fragments nothing will ever append.
@@ -985,6 +1227,7 @@
             }
             queueAppend(audioTrack, payload);
             break;
+          }
           case FRAME_KIND.ERROR: {
             const decoded = JSON.parse(textDecoder.decode(payload));
             // Same wire kind for both, so the payload's `track` field is what
@@ -1150,6 +1393,8 @@
       // One POST: send `body`, read the framed binary response to completion.
       // Returns nothing; it feeds handleFrame() through drainFrames().
       async function streamOneRequest(url, body, label) {
+        // Per-request clock for the burst check; harmless for a single prompt.
+        markRequestStart();
         appendLog(`POST ${url}${label ? ` (${label})` : ""}`);
         appendLog(`Waiting for stream response (timeout ${CONNECT_TIMEOUT_MS / 1000}s)`);
         setStat(modeStat, `Mode: connecting${label ? ` (${label})` : ""}`);
@@ -1247,6 +1492,13 @@
         const model = modelInput.value.trim();
         const fps = readFps();
 
+        // One clock for the whole run, set after resetPlaybackState() (which
+        // clears it). For a storyboard every scene is timed against this same
+        // epoch, so the gaps between the chained requests are counted as the
+        // real wall time they are -- steady fps should not get to skip them.
+        resetAchieved();
+        fpsEpoch = performance.now();
+
         try {
           if (storyboardMode) {
             await startStoryboardStream(url, model, fps);
@@ -1264,6 +1516,7 @@
           streamDone = true;
           maybeEndOfStream();
           setStat(modeStat, "Mode: complete");
+          logAchievedSummary();
           streamInFlight = false;
           startBtn.disabled = false;
         }

@@ -160,9 +160,19 @@ class OmniStageRouter:
         annotations_early = (
             (nvext_early.get("annotations") or []) if isinstance(nvext_early, dict) else []
         )
+        # The live pump needs a DiT stage to drive and a separate VAE stage to
+        # stream pixels from, so it is 2-stage by construction. A single-stage
+        # (aggregated) deploy runs the whole rollout+decode in one worker and has
+        # no intermediate stream to pump; it falls through to the batch loop
+        # below, which is stage-count agnostic and still honours cmaf_enabled by
+        # fragmenting the finished clip. Gating on the stage count here rather
+        # than erroring inside _stream_cmaf_live is what lets the aggregated
+        # config serve the same CMAF route -- which is the only way to compare
+        # aggregated against disaggregated over an identical wire protocol.
         cmaf_live = (
             request_type == RequestType.VIDEO_GENERATION
             and CMAF_ANNOTATION in annotations_early
+            and len(self.stage_configs) >= 2
         )
         if cmaf_live:
             async for chunk in self._stream_cmaf_live(request, request_id, request_type):
@@ -525,30 +535,43 @@ class OmniStageRouter:
 
         Three concurrent tasks, chained by the handoffs in :mod:`cf_pipeline`::
 
-            rollout ──Relay──> decode ──FrameQueue──> encoder thread ──> client
+            rollout --Relay--> decode --FrameQueue--> encoder thread --> client
 
         The decode task is the one that has to stay strictly ordered: the VAE's
         temporal ``feat_cache`` makes block N's first frame depend on block N-1's
         last, so it awaits each block in turn. Reordering there would not fail --
         it would produce visible seams. The rollout ahead of it and the encoder
         behind it are free to run as fast as they can.
-        """
-        if len(self.stage_configs) < 2:
-            yield {
-                "error": "Causal-Forcing session streaming needs the 2-stage "
-                "(DiT + VAE) disaggregated pipeline",
-                "finished": True,
-            }
-            return
 
-        dit_stage, vae_stage = self.stage_configs[0], self.stage_configs[1]
+        **Aggregated (single-stage) deploys use this same lane**, with the decode
+        task absent rather than replaced. The blocks a ``full``-role worker emits
+        are already pixels -- ``session_drain`` decodes inline, returning exactly
+        what ``session_decode_step`` returns on a VAE stage -- so they arrive on
+        the same ``(final_stage, "router")`` connector edge and need no second
+        hop. Two of the three tasks remain::
+
+            rollout (pixels) --FrameQueue--> encoder thread --> client
+
+        So the aggregated run gets encoder overlap but no DiT/VAE overlap, since
+        the inline decode is serial within the rollout. That is the point of
+        measuring it: it isolates how much of the disaggregated speedup is the
+        encoder leaving the critical path from how much is the two model stages
+        overlapping.
+        """
+        n_stages = len(self.stage_configs)
         dit_client = self.stage_clients.get(
-            getattr(dit_stage.engine_args, "model_stage", "stage0")
+            getattr(self.stage_configs[0].engine_args, "model_stage", "stage0")
         )
-        vae_client = self.stage_clients.get(
-            getattr(vae_stage.engine_args, "model_stage", "stage1")
+        # None on a single-stage deploy, and checked for below only in the branch
+        # that would use it -- the aggregated lane never dispatches a second hop.
+        vae_client = (
+            self.stage_clients.get(
+                getattr(self.stage_configs[1].engine_args, "model_stage", "stage1")
+            )
+            if n_stages >= 2
+            else None
         )
-        if dit_client is None or vae_client is None:
+        if dit_client is None or (n_stages >= 2 and vae_client is None):
             yield {
                 "error": "Missing stage client for the CF pipeline",
                 "finished": True,
@@ -598,8 +621,31 @@ class OmniStageRouter:
             else:
                 frames.close()
 
+        async def collect() -> None:
+            """Aggregated: read each block's already-decoded pixels, no second hop.
+
+            The mirror of ``decode`` for a single-stage deploy. Same ordering, same
+            queue, same canonical conversion -- what it drops is the RPC, because a
+            ``full``-role worker decoded this block inline and put the pixels on the
+            router edge before announcing it. There is also no decode cursor to
+            release on ``cf_last``: the one worker owns both halves, and its own
+            ``finally`` closes the session when the scene asked it to.
+            """
+            try:
+                async for output in blocks:
+                    if output.cf_last:
+                        break
+                    decoded = await self._read_cf_block(
+                        output, request_id, output.cf_block or 0
+                    )
+                    frames.put(decoded_chunk_to_canonical(decoded))
+            except BaseException as e:  # noqa: BLE001 -- re-raised in the consumer
+                frames.close(e)
+            else:
+                frames.close()
+
         rollout_task = asyncio.create_task(rollout())
-        decode_task = asyncio.create_task(decode())
+        decode_task = asyncio.create_task(decode() if n_stages >= 2 else collect())
         try:
             if cmaf:
                 # The live formatter reports its own failures as a CMAF failure
@@ -694,13 +740,26 @@ class OmniStageRouter:
             last = output
         if last is None:
             raise RuntimeError(f"VAE stage returned nothing for block {block}")
+        return await self._read_cf_block(last, request_id, block)
 
+    async def _read_cf_block(
+        self, output: StageOutput, request_id: str, block: int
+    ) -> Any:
+        """Read one block of pixels off the final stage's router connector edge.
+
+        Split out of ``_fetch_cf_block`` because the aggregated lane needs the read
+        without the dispatch that precedes it: a ``full``-role worker decodes inline
+        and has already put finished pixels on this edge, so the block the rollout
+        announced is the block to read. Disaggregated, the same read runs against
+        the VAE stage's output after its RPC returns. One reader either way, so the
+        per-block key convention and the no-fallback rule below cannot drift apart.
+        """
         final_stage_id = self.stage_configs[-1].stage_id
         connector = self.connectors.get(_connector_key(final_stage_id, "router"))
-        metadata = (last.stage_connector_refs or {}).get(str(final_stage_id))
+        metadata = (output.stage_connector_refs or {}).get(str(final_stage_id))
         if connector is None or metadata is None:
             raise RuntimeError(
-                f"block {block}: the VAE stage produced no router connector ref; a "
+                f"block {block}: the final stage produced no router connector ref; a "
                 "pipelined stream cannot use the SHM-by-request-id fallback, since "
                 "every block would collide on one key"
             )
@@ -715,7 +774,7 @@ class OmniStageRouter:
             )
         )
         if is_empty_payload(payload):
-            raise RuntimeError(f"block {block}: empty payload from the VAE stage")
+            raise RuntimeError(f"block {block}: empty payload from the final stage")
         return payload
 
     async def _format_output(

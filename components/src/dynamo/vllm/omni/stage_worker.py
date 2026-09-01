@@ -11,6 +11,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from collections.abc import Mapping
 from typing import Any, AsyncGenerator
@@ -490,6 +491,16 @@ class OmniStageWorker:
         rollout and then the DiT stage idle for the whole decode. One block per
         RPC costs a host round-trip each (~585 KB pickled at 480x832, against
         ~0.96 s of compute) and buys the overlap.
+
+        Serves the aggregated (single-stage) deploy as well, where this worker is
+        also the last one. What ``drain`` returns is decided by the pipeline's
+        role, not by this method: role ``dit`` has no VAE so its blocks are
+        latents bound for stage 1, while role ``full`` decodes inline and yields
+        pixels that are already final. Both are handed to the next hop by the
+        same ``_cf_put_block`` call -- only the destination differs, and
+        ``_is_final_stage`` picks it. There is still no DiT/VAE overlap in the
+        aggregated case (the inline decode is serial inside the rollout), but the
+        encoder still overlaps, which is exactly the part this lane contributes.
         """
         cf_req = parse_cf_session(request.get("nvext"))
         if cf_req is None:  # pragma: no cover -- the caller established this
@@ -524,7 +535,9 @@ class OmniStageWorker:
                     # continue the shot.
                     break
                 latents = blocks[0]
-                metadata = await self._cf_put_block(latents, request_id, block)
+                metadata = await self._cf_put_block(
+                    latents, request_id, block, to_router=self._is_final_stage()
+                )
                 yield {
                     "original_prompt": {"prompt": prompt},
                     "stage_connector_refs": {str(self.stage_id): metadata},
@@ -589,18 +602,58 @@ class OmniStageWorker:
         # A decode cursor is cheap to open and has no history to lose, so unlike a
         # rollout it may be opened on any block -- which is what lets the VAE
         # stage recover from having been restarted mid-stream.
+        #
+        # Timed in four parts because an aggregate per-block number cannot tell a
+        # busy card from a busy queue, and this stage was for a while suspected of
+        # the former when it was doing the latter. ensure_open is broken out on its
+        # own precisely because it is the non-obvious cost: it is a BROADCAST to
+        # every replica (session_info, via open_sessions) issued once per block, so
+        # it cannot return until the slowest replica answers -- and a replica
+        # mid-decode answers only when its decode is done.
+        t0 = time.monotonic()
         await dispatcher.ensure_open(session_id)
+        t_ensure = time.monotonic()
 
         latents = await self._cf_get_block(req, request_id, block)
+        t_get = time.monotonic()
         frames = await dispatcher.decode_step(session_id, latents)
+        t_decode = time.monotonic()
 
         metadata = await self._cf_put_block(frames, request_id, block, to_router=True)
+        logger.info(
+            "[CF_BLOCK_TIME] session=%s block=%d ensure=%.0fms get=%.0fms "
+            "decode_rpc=%.0fms put=%.0fms total=%.0fms",
+            session_id,
+            block,
+            (t_ensure - t0) * 1e3,
+            (t_get - t_ensure) * 1e3,
+            (t_decode - t_get) * 1e3,
+            (time.monotonic() - t_decode) * 1e3,
+            (time.monotonic() - t0) * 1e3,
+        )
         yield {
             "stage_connector_refs": {str(self.stage_id): metadata},
             "cf_session": session_id,
             "cf_block": block,
             "finished": True,
         }
+
+    def _is_final_stage(self) -> bool:
+        """Whether this worker's output goes to the router rather than to a stage.
+
+        Decided by the connector edges the YAML declares, which is the same signal
+        the batch path uses at the top of ``generate`` and deliberately not
+        ``final_output``: in vllm-omni's native mode several stages can set
+        ``final_output=True`` (it means "produces user-visible output"), so it does
+        not identify the last one. An edge to ``stage_id + 1`` exists only when
+        there is a stage there to receive it, so its absence is what "last" means
+        here -- and it makes the aggregated deploy fall out of the topology rather
+        than out of a stage-count special case.
+        """
+        return (
+            self.connectors.get(_connector_key(self.stage_id, self.stage_id + 1))
+            is None
+        )
 
     async def _cf_put_block(
         self, payload: Any, request_id: str, block: int, *, to_router: bool = False
