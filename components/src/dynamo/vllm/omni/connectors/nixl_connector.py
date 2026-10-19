@@ -83,6 +83,7 @@ class DynamoOmniNixlConnector(OmniConnectorBase):
         self._loop_thread: threading.Thread | None = None
         self._loop_ready = threading.Event()
         self._receive_device = _resolve_configured_receive_device(self.config)
+        self._send_device = _resolve_configured_send_device(self.config)
         self._pending_timeout_s = float(
             self.config.get("pending_timeout_s", _DEFAULT_PENDING_TIMEOUT_S)
         )
@@ -98,10 +99,12 @@ class DynamoOmniNixlConnector(OmniConnectorBase):
         self._metrics: dict[str, int] = {"puts": 0, "gets": 0, "errors": 0}
         self._start_loop_thread()
         logger.info(
-            "[DynamoOmniNixlConnector] Initialized (nixl_available=%s timeout=%ss interval=%ss receive_device=%s)",
+            "[DynamoOmniNixlConnector] Initialized (nixl_available=%s timeout=%ss interval=%ss "
+            "send_device=%s receive_device=%s)",
             _NIXL_AVAILABLE,
             self._pending_timeout_s,
             self._cleanup_interval_s,
+            self._send_device,
             self._receive_device,
         )
 
@@ -253,7 +256,9 @@ class DynamoOmniNixlConnector(OmniConnectorBase):
 
             kind = _TENSOR_PAYLOAD_KIND
             if _is_tensor_payload(data):
-                tensors, tensor_specs = _normalize_tensor_payload(data)
+                tensors, tensor_specs = _normalize_tensor_payload(
+                    data, send_device=self._send_device
+                )
             else:
                 serialized_data = self.serialize_obj(data)
                 payload_tensor = _bytes_to_uint8_tensor(
@@ -511,7 +516,15 @@ def _bytes_to_uint8_tensor(value: bytes, device: torch.device) -> torch.Tensor:
 
 def _normalize_tensor_payload(
     payload: Any,
+    send_device: torch.device | None = None,
 ) -> tuple[list[torch.Tensor], list[dict[str, Any]]]:
+    """Flatten a tensor payload into contiguous tensors plus the specs describing them.
+
+    ``send_device`` moves each tensor BEFORE its spec is recorded, which is the whole
+    reason it is applied here rather than in ``put``: the receiver reads ``spec["device"]``
+    back as ``source_device``, so a move afterwards would leave the two disagreeing and
+    the receiver would allocate for a device the sender no longer exposes.
+    """
     tensors = [payload] if isinstance(payload, torch.Tensor) else list(payload)
     normalized: list[torch.Tensor] = []
     tensor_specs: list[dict[str, Any]] = []
@@ -519,6 +532,8 @@ def _normalize_tensor_payload(
         if not isinstance(tensor, torch.Tensor):
             raise TypeError("Tensor payload must contain only torch.Tensor values")
         contiguous = tensor.detach().contiguous()
+        if send_device is not None and contiguous.device != send_device:
+            contiguous = contiguous.to(device=send_device).contiguous()
         normalized.append(contiguous)
         tensor_specs.append(
             {
@@ -574,6 +589,25 @@ def _resolve_torch_dtype(dtype_name: Any) -> torch.dtype:
 
 def _resolve_configured_receive_device(config: dict[str, Any]) -> torch.device | None:
     configured = config.get("receive_device", config.get("target_device"))
+    return _parse_torch_device(configured)
+
+
+def _resolve_configured_send_device(config: dict[str, Any]) -> torch.device | None:
+    """The mirror of ``receive_device``, for the side that EXPOSES the buffer.
+
+    ``receive_device`` only governs where the receiver lands the data; ``put`` registers
+    its descriptors on whatever device the tensors already occupy, so a heterogeneous
+    edge whose transports cannot read remote device memory needs the sender told
+    separately. Setting ``send_device: cpu`` stages the payload through host memory.
+
+    The failure this exists for: a CUDA-resident latent block on a TCP-only edge, where
+    the receiver's UCX has no protocol for it and says so on the RECEIVING host --
+        UCX ERROR cannot find remote protocol for: ... get(multi) into host memory from cuda
+    -- while the sender logs a clean put and the router reports only "empty payload for
+    block 0 from stage 0". Under RoCE ``cuda_copy`` fed the HCA straight from device
+    memory and hid the asymmetry; drop ``rc`` and it surfaces.
+    """
+    configured = config.get("send_device", config.get("source_device"))
     return _parse_torch_device(configured)
 
 

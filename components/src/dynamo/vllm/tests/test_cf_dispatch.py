@@ -11,7 +11,7 @@ invisible in the output: the client would get a video that never changed.
 import pytest
 from conftest import as_transport_returns
 from dynamo.vllm.omni.cf_dispatch import CFDispatchError, CFSessionDispatcher
-from dynamo.vllm.omni.cf_session import CFSceneRequest, CFSessionRequest
+from dynamo.common.omni.cf_session import CFSceneRequest, CFSessionRequest
 
 pytestmark = pytest.mark.unit
 
@@ -21,6 +21,9 @@ class FakeEngine:
 
     def __init__(self, results=None, raises=None):
         self.calls = []
+        # (method, replica_key, release_replica_key) per call, so tests can pin the
+        # routing decision as well as the payload.
+        self.routing = []
         self._results = results or {}
         self._raises = raises
         self.open = []
@@ -30,9 +33,17 @@ class FakeEngine:
         self.open.remove(session_id)
 
     async def collective_rpc(
-        self, method, timeout=None, args=(), kwargs=None, stage_ids=None
+        self,
+        method,
+        timeout=None,
+        args=(),
+        kwargs=None,
+        stage_ids=None,
+        replica_key=None,
+        release_replica_key=False,
     ):
         self.calls.append((method, args, kwargs))
+        self.routing.append((method, replica_key, release_replica_key))
         if self._raises is not None:
             raise self._raises
         if method in self._results:
@@ -81,7 +92,15 @@ def _returning(value):
     """A dispatcher whose transport returns ``value`` verbatim, unwrapped."""
     engine = FakeEngine()
 
-    async def verbatim(method, timeout=None, args=(), kwargs=None, stage_ids=None):
+    async def verbatim(
+        method,
+        timeout=None,
+        args=(),
+        kwargs=None,
+        stage_ids=None,
+        replica_key=None,
+        release_replica_key=False,
+    ):
         return value
 
     engine.collective_rpc = verbatim
@@ -141,6 +160,101 @@ async def test_too_few_wrapper_levels_is_a_loud_error(shallow):
     nesting changes, this is where it should be noticed."""
     with pytest.raises(CFDispatchError, match="wrapper level"):
         await _returning(shallow).open_sessions()
+
+
+# -- replica routing -------------------------------------------------------
+#
+# The bug these exist for: every session RPC fanned out to all live replicas and the
+# unwrap above kept the first result. With 4 VAE replicas that decoded each chunk four
+# times, serially, and discarded three copies -- a 3.6x slowdown whose output was
+# byte-identical to a correct run, so nothing in the video pointed at it.
+
+
+@pytest.mark.parametrize(
+    "call, method",
+    [
+        (lambda d: d.ensure_open("s1"), "session_open"),
+        (lambda d: d.push("s1", "a reef"), "session_push"),
+        (lambda d: d.drain("s1"), "session_drain"),
+        (lambda d: d.decode_step("s1", "latents"), "session_decode_step"),
+        (lambda d: d.close("s1"), "session_close"),
+    ],
+    ids=["open", "push", "drain", "decode_step", "close"],
+)
+async def test_every_session_rpc_is_keyed_to_its_session(call, method):
+    """A session's state -- the DiT's KV window, the VAE's feat_cache -- lives on the
+    one replica that opened it, so every call must carry the key that routes it back."""
+    d, engine = _dispatcher()
+    await call(d)
+    keyed = next(r for r in engine.routing if r[0] == method)
+    assert keyed[1] == "s1", f"{method} must be keyed to the session"
+
+
+async def test_close_releases_the_binding_and_nothing_else_does():
+    """Releasing early would send the closing call itself to a different replica,
+    leaving the original's window pinned until it expired; never releasing would leak
+    a binding per session and eventually pin every session to one replica."""
+    d, engine = _dispatcher()
+    await d.run_scene(
+        CFSessionRequest("s1", CFSceneRequest(transition="cut"), close=True), "shot"
+    )
+    releasing = [r[0] for r in engine.routing if r[2]]
+    assert releasing == ["session_close"]
+
+
+async def test_stage_wide_questions_are_not_keyed():
+    """open_sessions asks the stage, not a replica: keying it would route to one replica
+    and report every session on the others as absent."""
+    d, engine = _dispatcher()
+    await d.open_sessions()
+    assert engine.routing == [("session_info", None, False)]
+
+
+async def test_is_open_asks_only_the_sessions_own_replica():
+    """The narrow question, keyed. Sound because the session's state lives on the
+    replica bound to its id, so no other replica's answer can change this one."""
+    d, engine = _dispatcher()
+    await d.is_open("s1")
+    assert engine.routing == [("session_info", "s1", False)]
+
+
+async def test_ensure_open_never_broadcasts():
+    """A PERFORMANCE regression test, and it is here because the cost was invisible.
+
+    ensure_open runs once per decoded block. Asking via the unkeyed broadcast made it
+    wait on EVERY replica -- control RPCs are serialized per replica, so a replica
+    mid-decode answers only when its decode finishes. Measured on the 4x2-shard XPU
+    VAE, that one line cost 358 ms of every 740 ms block at 4 concurrent streams
+    against 9 ms at 1, because no stream could begin a block until all four replicas
+    happened to be idle simultaneously. Four independent pipelines, run in lockstep.
+
+    Nothing about the OUTPUT changes when this regresses -- the video stays
+    byte-identical and only throughput moves -- so an output assertion cannot catch
+    it. Hence pinning the routing decision itself: every RPC ensure_open makes must
+    carry a replica key.
+    """
+    d, engine = _dispatcher()
+    await d.ensure_open("s1")
+    await d.ensure_open("s1")
+    assert engine.routing, "ensure_open made no calls; the test proves nothing"
+    unkeyed = [method for method, key, _ in engine.routing if key is None]
+    assert unkeyed == [], f"ensure_open broadcast to every replica via {unkeyed}"
+
+
+async def test_open_sessions_unions_across_replicas():
+    """The failure this prevents: a session running on replica 1 looks absent, so
+    ensure_open opens a second copy of a shot that is already mid-rollout."""
+    d = _returning([[{"sessions": [{"session_id": "s1"}]}], [{"sessions": [{"session_id": "s2"}]}]])
+    assert sorted(await d.open_sessions()) == ["s1", "s2"]
+
+
+async def test_a_stage_error_reports_the_workers_complaint_not_the_transport():
+    """StagePool swallows the worker's exception into a dict, which lands one wrapper
+    level early. Blaming the nesting sends the reader to the transport while the real
+    cause -- here a session limit -- sits unread in the dict; that cost a day."""
+    d = _returning({"supported": False, "error": "Worker is at its dit session limit (1/1)"})
+    with pytest.raises(CFDispatchError, match="session limit"):
+        await d.open_sessions()
 
 
 # -- lifecycle -------------------------------------------------------------
@@ -275,10 +389,10 @@ async def test_run_scene_closes_even_when_the_rollout_fails():
     d = CFSessionDispatcher(engine, stage_id=0)
     real = engine.collective_rpc
 
-    async def fail_on_drain(method, timeout=None, args=(), kwargs=None, stage_ids=None):
+    async def fail_on_drain(method, *a, **kw):
         if method == "session_drain":
             raise RuntimeError("rollout blew up")
-        return await real(method, timeout, args, kwargs, stage_ids)
+        return await real(method, *a, **kw)
 
     engine.collective_rpc = fail_on_drain
     with pytest.raises(CFDispatchError):

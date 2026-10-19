@@ -158,6 +158,98 @@ def test_nixl_connector_cleanup_clears_pending(fake_nixl):
         connector.close()
 
 
+# -- send_device -----------------------------------------------------------
+#
+# receive_device governs only where the receiver lands the data. put() registers its
+# descriptors on whatever device the tensors already occupy, so on a heterogeneous edge
+# whose transports cannot read remote device memory the SENDER has to be told too. The
+# failure this covers: a CUDA-resident latent block on a TCP-only edge, where the
+# receiving host's UCX reports "cannot find remote protocol for: get(multi) into host
+# memory from cuda" and the router reports only "empty payload for block 0" -- nothing on
+# either side naming the sender's buffer. Under RoCE cuda_copy hid the asymmetry.
+#
+# "meta" stands in for a foreign device throughout, so these run without a second vendor's
+# runtime present; the mechanism under test is device-agnostic.
+
+
+@pytest.mark.parametrize(
+    "config, expected",
+    [
+        ({}, None),
+        ({"send_device": "cpu"}, "cpu"),
+        ({"source_device": "cpu"}, "cpu"),
+    ],
+    ids=["unset", "send_device", "source_device-alias"],
+)
+def test_send_device_is_resolved_from_config(config, expected):
+    resolved = nixl_module._resolve_configured_send_device(config)
+    assert (None if resolved is None else resolved.type) == expected
+
+
+def test_an_unset_send_device_leaves_the_payload_where_it_is():
+    """The default must stay "expose it in place": every homogeneous deployment relies on
+    it, and a staging copy nobody asked for would be pure overhead."""
+    payload = torch.arange(4, dtype=torch.float32)
+    tensors, specs = nixl_module._normalize_tensor_payload(payload)
+    assert tensors[0].device == payload.device
+    assert specs[0]["device"] == str(payload.device)
+
+
+def test_send_device_moves_the_payload_before_the_spec_is_written():
+    """The invariant that makes this safe: the receiver reads spec["device"] back as
+    source_device, so the move has to happen before the spec is built. Moving afterwards
+    would leave the two disagreeing and the receiver allocating for a device the sender
+    no longer exposes."""
+    tensors, specs = nixl_module._normalize_tensor_payload(
+        torch.arange(4, dtype=torch.float32),
+        send_device=torch.device("meta"),
+    )
+    assert tensors[0].device.type == "meta"
+    assert specs[0]["device"] == str(tensors[0].device)
+
+
+def test_every_tensor_in_a_multi_tensor_payload_is_moved():
+    """A latent block arrives as a list, and one straggler left on the source device is
+    enough to fail the whole read."""
+    tensors, specs = nixl_module._normalize_tensor_payload(
+        [torch.zeros(2), torch.ones(3)],
+        send_device=torch.device("meta"),
+    )
+    assert [t.device.type for t in tensors] == ["meta", "meta"]
+    assert {s["device"] for s in specs} == {"meta"}
+
+
+def test_put_registers_and_advertises_the_send_device(fake_nixl):
+    """End to end through the config: what put retains for the remote read and what it
+    puts on the wire must both be the configured device, not the payload's original."""
+    connector = nixl_module.DynamoOmniNixlConnector(config={"send_device": "meta"})
+    try:
+        ok, _, metadata = connector.put(
+            "0", "1", "req-send", torch.arange(4, dtype=torch.float32)
+        )
+        assert ok is True
+        assert metadata["tensor_specs"][0]["device"] == "meta"
+        retained = connector._pending["req-send"][2]
+        assert [t.device.type for t in retained] == ["meta"]
+    finally:
+        connector.close()
+
+
+def test_a_send_device_does_not_disturb_the_serialized_path(fake_nixl):
+    """Serialized objects are built on the host already. They must keep round-tripping
+    whatever the tensor edge is configured to do, or setting send_device for the latent
+    hop would break the router's own object payloads."""
+    connector = nixl_module.DynamoOmniNixlConnector(config={"send_device": "cpu"})
+    try:
+        ok, _, metadata = connector.put("1", "router", "req-obj", {"kind": "text"})
+        assert ok is True
+        assert metadata["kind"] == "serialized_obj"
+        received, _ = connector.get("1", "router", "req-obj", metadata=metadata)
+        assert received == {"kind": "text"}
+    finally:
+        connector.close()
+
+
 def test_register_dynamoomni_nixl_connector_registers_when_missing(monkeypatch):
     factory = MagicMock()
     factory.list_registered_connectors.return_value = []

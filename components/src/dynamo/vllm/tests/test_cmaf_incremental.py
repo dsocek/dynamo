@@ -23,7 +23,7 @@ import json
 import numpy as np
 import pytest
 from dynamo.common.utils.video_utils import iter_fragmented_mp4_boxes
-from dynamo.vllm.omni.cmaf_video import (
+from dynamo.common.omni.cmaf_video import (
     CMAF_FALLBACK_VIDEO_CODEC,
     CMAF_OPEN_ENDED,
     metadata_bytes,

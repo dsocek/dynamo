@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from conftest import as_transport_returns
-from dynamo.vllm.omni.cf_pipeline import cf_put_key
+from dynamo.common.omni.cf_pipeline import cf_put_key
 from dynamo.vllm.omni.stage_worker import (
     OmniStageWorker,
     _cf_open_kwargs,
@@ -42,8 +42,22 @@ class _SessionEngine:
         return None
 
     async def collective_rpc(
-        self, method, timeout=None, args=(), kwargs=None, stage_ids=None
+        self,
+        method,
+        timeout=None,
+        args=(),
+        kwargs=None,
+        stage_ids=None,
+        replica_key=None,
+        release_replica_key=False,
     ):
+        # replica_key/release_replica_key are accepted because the real engine takes
+        # them and CFSessionDispatcher._rpc always passes them: a keyed call is how a
+        # session stays pinned to the replica holding its state. A fake that rejected
+        # them would fail every keyed call while the unkeyed broadcast path passed,
+        # which is the wrong way round -- the keyed path is the one in the hot loop.
+        # This fake models ONE replica, so the key needs no effect here beyond being
+        # tolerated; per-replica binding is StagePool's job and is tested there.
         # as_transport_returns() applies the real transport's two wrapper levels; see
         # its docstring for why a fake that wraps only once is worse than no fake.
         self.calls.append((method, args, kwargs or {}))

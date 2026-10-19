@@ -32,8 +32,12 @@ to the preceding scenes' KV window, so it reproduces exactly when the scenes bef
 are unchanged -- true when replaying a storyboard, false once an earlier scene is
 edited. The field is accepted either way; only the guarantee narrows.
 
-This module only parses and validates. Dispatch onto the worker-side registry lives in
-``stage_worker``, which reaches the pipeline via ``collective_rpc``.
+This module only parses and validates, which is why it is shared: the annotations are a
+contract with the browser client, and both backends that serve this protocol have to
+read them the same way. What differs is dispatch, and that stays with the backend --
+``dynamo.vllm.omni.cf_dispatch`` reaches a worker-side session registry via
+``collective_rpc``, while ``dynamo.sglang.omni.cf_dispatch`` drives one chunk-sized
+request per block over SGLang's scheduler protocol.
 """
 
 from __future__ import annotations

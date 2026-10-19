@@ -833,6 +833,17 @@ def encode_video_fragments(
     cmd += ["-c:v", encoder]
     if hw_accel == "cpu":
         cmd += ["-pix_fmt", "yuv420p"]
+        if encoder in ("libx264", "libx265"):
+            # x264/x265 hold frames back for lookahead and frame-threading before
+            # emitting anything, and how many scales with the core count: on a
+            # 96-core host the first fragment of a live stream appeared 10.8s after
+            # frames started flowing, against 4.2s with the buffer off -- and 4.2s
+            # was exactly one GOP, which is the fragmented-MP4 lag that cannot be
+            # removed. So the encoder was holding more than twice the latency the
+            # format itself costs. A live stream has no budget for lookahead, so it
+            # is disabled here and only here: :func:`encode_video` is a batch encode
+            # where the same lookahead is free and makes a smaller file.
+            cmd += ["-tune", "zerolatency"]
     cmd += [
         "-g",
         str(gop),

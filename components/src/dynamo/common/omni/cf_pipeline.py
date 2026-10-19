@@ -26,6 +26,12 @@ needs two different handoffs, and this module holds both:
     thread, which pulls with an ordinary ``for``. Off the event loop by
     construction: the thread blocks on ``get`` while the loop keeps filling it.
 
+``AsyncFragments``
+    blocking-iterator -> async. The return leg: the encoder hands finished CMAF
+    fragments back as a blocking generator, and the request that has to yield them
+    is ``async``. Third handoff in the same chain, so it lives here beside the
+    other two rather than in either backend.
+
 Both carry a *terminal error* alongside the terminal marker, which is the part
 worth being deliberate about. A consumer that only knows "the producer stopped"
 cannot tell a finished stream from a crashed one -- and for video the two look
@@ -165,3 +171,47 @@ class FrameQueue:
                     raise self._error
                 return
             yield item
+
+
+_FRAGMENTS_DONE = object()
+
+
+class AsyncFragments:
+    """Adapts a blocking fragment generator to ``async for``, one step per thread hop.
+
+    The encoder generator blocks on a subprocess pipe. Iterating it directly on
+    the event loop would stall every other request in this worker for the whole
+    encode -- which in a streaming deploy is unbounded. Each ``next()`` therefore
+    runs via :func:`asyncio.to_thread`.
+
+    One step at a time rather than a producer thread with a queue, deliberately:
+    the generator is only ever touched by one thread at a time, so there is no
+    shared mutable state to get wrong, and back-pressure stays natural -- nothing
+    is encoded ahead of what the client has taken. The cost is a thread hop per
+    segment, which is nothing against encoding one.
+    """
+
+    def __init__(self, generator) -> None:
+        self._gen = generator
+        self._closed = False
+
+    def __aiter__(self) -> "AsyncFragments":
+        return self
+
+    async def __anext__(self):
+        item = await asyncio.to_thread(next, self._gen, _FRAGMENTS_DONE)
+        if item is _FRAGMENTS_DONE:
+            raise StopAsyncIteration
+        return item
+
+    async def aclose(self) -> None:
+        """Close the generator so its cleanup runs (it reaps the encoder process).
+
+        Idempotent, and safe to call after exhaustion -- the streaming formatters
+        call it from a ``finally``, where the normal-completion path has already
+        run the generator to the end.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        await asyncio.to_thread(self._gen.close)

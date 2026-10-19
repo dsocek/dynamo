@@ -18,7 +18,7 @@ import pytest
 import torch
 from dynamo.common.utils.output_modalities import RequestType
 from dynamo.vllm.omni import stage_router
-from dynamo.vllm.omni.cf_pipeline import cf_put_key
+from dynamo.common.omni.cf_pipeline import cf_put_key
 
 pytestmark = pytest.mark.unit
 

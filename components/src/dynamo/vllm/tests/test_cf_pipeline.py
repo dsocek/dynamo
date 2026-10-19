@@ -13,7 +13,7 @@ import asyncio
 import numpy as np
 import pytest
 import torch
-from dynamo.vllm.omni.cf_pipeline import FrameQueue, Relay, cf_put_key
+from dynamo.common.omni.cf_pipeline import FrameQueue, Relay, cf_put_key
 from dynamo.vllm.omni.video_convert import decoded_chunk_to_canonical
 
 pytestmark = pytest.mark.unit

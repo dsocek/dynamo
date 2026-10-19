@@ -28,7 +28,8 @@ from dynamo.common.utils.engine_response import normalize_finish_reason
 from dynamo.common.utils.output_modalities import RequestType
 from dynamo.common.utils.video_utils import StreamingCmafEncoder, encode_video
 from dynamo.vllm.handlers import build_prompt_tokens_details
-from dynamo.vllm.omni.cmaf_video import (
+from dynamo.common.omni.cf_pipeline import AsyncFragments
+from dynamo.common.omni.cmaf_video import (
     CMAF_FALLBACK_VIDEO_CODEC,
     CMAF_INIT_TAG,
     CMAF_METADATA_TAG,
@@ -44,48 +45,10 @@ from dynamo.vllm.omni.video_convert import to_canonical
 
 logger = logging.getLogger(__name__)
 
-_FRAGMENTS_DONE = object()
-
-
-class _AsyncFragments:
-    """Adapts a blocking fragment generator to ``async for``, one step per thread hop.
-
-    The encoder generator blocks on a subprocess pipe. Iterating it directly on
-    the event loop would stall every other request in this worker for the whole
-    encode -- which in a streaming deploy is unbounded. Each ``next()`` therefore
-    runs via :func:`asyncio.to_thread`.
-
-    One step at a time rather than a producer thread with a queue, deliberately:
-    the generator is only ever touched by one thread at a time, so there is no
-    shared mutable state to get wrong, and back-pressure stays natural -- nothing
-    is encoded ahead of what the client has taken. The cost is a thread hop per
-    segment, which is nothing against encoding one.
-    """
-
-    def __init__(self, generator) -> None:
-        self._gen = generator
-        self._closed = False
-
-    def __aiter__(self) -> "_AsyncFragments":
-        return self
-
-    async def __anext__(self):
-        item = await asyncio.to_thread(next, self._gen, _FRAGMENTS_DONE)
-        if item is _FRAGMENTS_DONE:
-            raise StopAsyncIteration
-        return item
-
-    async def aclose(self) -> None:
-        """Close the generator so its cleanup runs (it reaps the encoder process).
-
-        Idempotent, and safe to call after exhaustion -- ``stream_video_cmaf``
-        calls it from a ``finally``, where the normal-completion path has already
-        run the generator to the end.
-        """
-        if self._closed:
-            return
-        self._closed = True
-        await asyncio.to_thread(self._gen.close)
+# Promoted to dynamo.common.omni.cf_pipeline so the SGLang-Omni formatter uses the
+# same adapter rather than a copy of it. Aliased under the old private name for
+# the existing tests that import it from here.
+_AsyncFragments = AsyncFragments
 
 
 class TextFormatter:

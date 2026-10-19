@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Binary CMAF packaging for the vLLM-Omni video path.
+"""Binary CMAF packaging for the omni video path.
 
 The Dynamo HTTP frontend exposes ``POST /v1/videos/stream/binary/cmaf``. That
 route injects the ``experimental_binary_cmaf`` annotation into the request and
@@ -12,6 +12,11 @@ base64 payload in ``VideoData.b64_json``:
     cmaf:metadata   -> JSON describing the asset (protocol, codecs, segment_count)
     cmaf:init       -> the fMP4 initialization segment
     cmaf:segment:N  -> the Nth fMP4 media segment
+
+Nothing here knows which engine produced the frames, which is why it is shared
+between the vLLM-Omni and SGLang-Omni backends: these tags are what the browser
+client reads, so one backend drifting from them would be a protocol break rather
+than a local bug.
 
 Wan2.1-T2V (and diffusion video generation generally) produces the *whole* clip
 in one call. The pipeline is therefore ``diffuser -> encode_video -> split ->

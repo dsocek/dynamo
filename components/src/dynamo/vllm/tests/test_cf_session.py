@@ -6,7 +6,7 @@ import json
 from typing import ClassVar
 
 import pytest
-from dynamo.vllm.omni.cf_session import (
+from dynamo.common.omni.cf_session import (
     CF_CLOSE_ANNOTATION,
     CFSessionRequestError,
     build_cf_annotations,
