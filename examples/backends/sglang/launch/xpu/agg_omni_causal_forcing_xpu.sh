@@ -16,7 +16,7 @@
 # rolling out, so the per-block cost is the *sum* of the two. Disaggregation exists
 # to overlap them -- see disagg_omni_causal_forcing_xpu.sh.
 #
-# Measured on sc09dell08-b70 (Intel Arc Pro B70), 832x480, 241 frames, median of 2,
+# Measured on Intel Arc Pro B70 cards, 832x480, 241 frames, median of 2,
 # every row launched with the flags this script sets, one vintage:
 #
 #   config                              GPUs  per-block  fps   streams 8 fps?
@@ -94,7 +94,7 @@ export ETCD_LEASE_TTL=600
 # Fresh namespace per run, so stale discovery entries from a previous stack cannot
 # route a request straight into a worker that is no longer there.
 export DYN_NAMESPACE="${DYN_NAMESPACE:-dynamo-sglang-cf-agg-$(date +%s)}"
-export HF_HOME="${HF_HOME:-/mnt/bigtmp/hf}"
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 
 MEDIA_URL="${MEDIA_URL:-file:///tmp/dynamo_media_cf}"
 

@@ -69,7 +69,7 @@ export ETCD_LEASE_TTL=600
 # Fresh namespace per run, so stale discovery entries from a previous stack cannot
 # route a request straight into a stage worker that is no longer there.
 export DYN_NAMESPACE="${DYN_NAMESPACE:-dynamo-sglang-cf-$(date +%s)}"
-export HF_HOME="${HF_HOME:-/mnt/bigtmp/hf}"
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 
 MEDIA_URL="${MEDIA_URL:-file:///tmp/dynamo_media_cf}"
 
@@ -139,7 +139,7 @@ DIT_ATTENTION_BACKEND="${DIT_ATTENTION_BACKEND:-torch_sdpa}"
 # the frame count and silently turns the shard off, leaving every rank to decode
 # the full height redundantly *and* pay the group sync. Asked for explicitly it
 # scales cleanly: 0.548s -> 0.419s -> 0.346s -> 0.299s per block on 1, 2, 3 and 4
-# cards (832x480, 241 frames, sc09dell08-b70 / Arc Pro B70).
+# cards (832x480, 241 frames, Intel Arc Pro B70).
 #
 # Note where that stops paying. Decode cards only help while the decode is the
 # slower half; once it drops below the rollout (~0.439s per block on one card, with
